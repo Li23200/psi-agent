@@ -15,7 +15,7 @@ from loguru import logger
 from psi_agent.channel._types import FileChunk, InputChunk, TextChunk
 
 RECV_MARKER = "[RECV:{path}]"
-SEND_RE = re.compile(r"\[\s*SEND\s*:\s*(.+?)\s*\]")
+SEND_RE = re.compile(r"\[\s*SEND\s*:\s*(.+?)\s*\]", re.IGNORECASE)
 
 
 def encode_input(chunks: list[InputChunk]) -> str:

@@ -183,6 +183,12 @@ describe('extractSendPaths', () => {
       extractSendPaths('ok\n[SEND:/ws/a.md]\n[ SEND:C:/docs/b.html ]'),
     ).toEqual(['/ws/a.md', 'C:/docs/b.html'])
   })
+
+  it('parses lowercase SEND markers', () => {
+    expect(
+      extractSendPaths('ok\n[Send:/ws/a.md]\n[send: C:/docs/b.html ]'),
+    ).toEqual(['/ws/a.md', 'C:/docs/b.html'])
+  })
 })
 
 describe('withTodoProgress (via layered resolver)', () => {

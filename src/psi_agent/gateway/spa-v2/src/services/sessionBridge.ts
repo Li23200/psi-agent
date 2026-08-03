@@ -30,7 +30,7 @@ export function basenameOf(path: string): string {
 /** Extract ``[SEND:path]`` values in order (parity with backend ``extract_send_paths``). */
 export function extractSendPaths(text: string): string[] {
   const out: string[] = []
-  const re = /\[\s*SEND\s*:\s*([^\]]*?)\s*\]/g
+  const re = /\[\s*SEND\s*:\s*([^\]]*?)\s*\]/gi
   let m: RegExpExecArray | null
   while ((m = re.exec(text ?? '')) !== null) {
     const p = m[1]?.trim()
