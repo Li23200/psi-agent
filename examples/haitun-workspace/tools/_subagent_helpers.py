@@ -13,7 +13,6 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
-import _runtime_paths as _paths
 import aiohttp
 import anyio
 
@@ -307,7 +306,12 @@ async def _fetch_spawn_config(gateway_url: str, ai_id: str) -> dict[str, str] | 
 
 
 def resolve_workspace(raw: str) -> Path:
-    return Path(_paths.workspace_dir(raw)).resolve()
+    if raw.strip():
+        return Path(raw.strip()).resolve()
+    env = os.environ.get("WORKSPACE_DIR", "").strip()
+    if env:
+        return Path(env).resolve()
+    return Path(__file__).resolve().parents[1]
 
 
 def resolve_project_root(workspace: Path) -> Path:
@@ -731,6 +735,14 @@ async def wait_socket(addr: str, *, timeout_seconds: float = 30.0) -> dict[str, 
     }
 
 
+def _resolve_deliverable_path(raw_path: str, *, workspace_raw: str = "") -> anyio.Path:
+    raw = (raw_path or "").strip() or "."
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return anyio.Path(str(candidate))
+    return anyio.Path(str(resolve_workspace(workspace_raw))) / raw
+
+
 _SEND_MARKER_RE = re.compile(r"\[SEND:([^\]]+)\]")
 
 
@@ -794,7 +806,7 @@ async def chat_subagent(
     missing: list[str] = []
     for raw_path in _SEND_MARKER_RE.findall(text):
         try:
-            path = _paths.resolve_user_path(raw_path.strip(), workspace_raw=workspace_raw)
+            path = _resolve_deliverable_path(raw_path, workspace_raw=workspace_raw)
             if await path.is_file():
                 stat = await path.stat()
                 files.append({"path": str(path), "bytes": stat.st_size})
