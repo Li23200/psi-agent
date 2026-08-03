@@ -5,8 +5,8 @@
 export function stripTransferMarkers(text: string): string {
   if (!text) return ''
   return String(text)
-    .replace(/\[SEND:[^\]]*\]/g, '')
-    .replace(/\[RECV:[^\]]*\]/g, '')
+    .replace(/\[\s*SEND\s*:[^\]]*\]/g, '')
+    .replace(/\[\s*RECV\s*:[^\]]*\]/g, '')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()

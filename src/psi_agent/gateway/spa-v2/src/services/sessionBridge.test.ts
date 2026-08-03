@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Task } from '../haitun-agent/model'
 import {
+  extractSendPaths,
   historyToChat,
   historyToDeliverables,
   withCompletedTurn,
@@ -173,6 +174,14 @@ describe('historyToDeliverables', () => {
       names: ['a.md', 'b.html'],
       paths: { 'a.md': '/other/a.md', 'b.html': '/ws/b.html' },
     })
+  })
+})
+
+describe('extractSendPaths', () => {
+  it('parses plain and space-padded SEND markers', () => {
+    expect(
+      extractSendPaths('ok\n[SEND:/ws/a.md]\n[ SEND:C:/docs/b.html ]'),
+    ).toEqual(['/ws/a.md', 'C:/docs/b.html'])
   })
 })
 
