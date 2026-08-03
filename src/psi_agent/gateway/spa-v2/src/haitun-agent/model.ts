@@ -25,7 +25,14 @@ export type Task = {
   shortTitle: string;
   category: string;
   summary: string;
+  /** 0–100 from todo completed/total, or 100 when done; ignore when ``progressIndeterminate``. */
   progress: number;
+  /** No todo list + in-flight — pulse UI, do not show a fake %. */
+  progressIndeterminate?: boolean;
+  /** Corner text when ``hasTodoTrack`` (e.g. ``2/5``). */
+  progressLabel?: string;
+  /** Session has an active todo list — sidebar shows real steps / N/M. */
+  hasTodoTrack?: boolean;
   status: TaskStatus;
   statusLabel: string;
   eta: string;
@@ -49,8 +56,10 @@ export type Task = {
 
 export type ChatFile = {
   name: string
-  /** Base64 payload (with or without data-URL prefix). */
+  /** Base64 payload (with or without data-URL prefix). Empty after history rehydrate until lazy-loaded. */
   data: string
+  /** Disk path from ``[SEND:]`` — used to reload preview after refresh. */
+  path?: string
 }
 
 export type MessageFeedback = "up" | "down" | "";
@@ -62,6 +71,16 @@ export type ChatMessage = {
   role: "agent" | "user";
   text: string;
   files?: ChatFile[];
+  /**
+   * Thinking prose for this assistant turn (may still contain live SSE tool markers;
+   * display strips them). History refresh uses prose-only ``reasoning`` plus ``tools``.
+   */
+  reasoning?: string;
+  /**
+   * Cursor-style tool activity one-liners for this turn (from live progress log
+   * and/or history ``tools`` projection). Rendered separately from「已思考」.
+   */
+  tools?: string[];
   /** Local-only: like / dislike on agent replies (spa v1 parity). */
   feedback?: MessageFeedback;
   /** User turn did not get a complete agent reply. */
@@ -71,7 +90,7 @@ export type ChatMessage = {
   stopped?: boolean;
 };
 
-export type SidebarPanel = "pending" | "deliveries" | "history" | null;
+export type SidebarPanel = "working" | "pending" | "deliveries" | "history" | null;
 export type MainView = "workspace" | "new-task" | "templates";
 
 export type TaskTemplate = {
@@ -94,10 +113,12 @@ export type CardTransition = {
 
 export type FocusHistoryItem = {
   id: string;
-  kind: "status" | "attention" | "delivery" | "update" | "conversation";
+  kind: "status" | "attention" | "delivery" | "update" | "conversation" | "segment";
   title: string;
   detail: string;
   time: string;
+  /** When kind=segment: todo segment id, or ``live`` for current checklist. */
+  segmentId?: string;
 };
 
 export const OVERVIEW_LABEL = "任务总览";

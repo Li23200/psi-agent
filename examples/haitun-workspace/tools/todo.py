@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -15,32 +16,38 @@ import _todo_store as _store
 
 
 async def todo(
-    todos: str = "",
+    todos: list[dict[str, str]] | None = None,
     merge: bool = False,
     workspace: str = "",
 ) -> str:
     """Manage your task list for the current session.
 
-    Use for complex work with **3+ steps** or **multiple sub-tasks**. The agent
-    decides when to create or update the list — users do not need to say
-    "break this down". Pair with ``skills/task-planning/SKILL.md``.
+    **When to use** (authoritative): ``skills/task-planning/SKILL.md``.
+    Create a list only when multi-step work is worth tracking (≈3+ checkable
+    steps, multi-file/multi-deliverable, or a long tool chain). Skip for
+    one-shot Q&A, pure chat, or when the user wants a direct result. Do **not**
+    invent a decorative list for the UI.
 
-    **Read:** call with empty ``todos`` (default).
+    The agent decides — users need not say "break this down".
 
-    **Write:** pass ``todos`` as a JSON array string, e.g.
+    **Read:** empty ``todos`` (default).
+
+    **Write:** ``todos`` as a JSON array string, e.g.
     ``[{"id":"1","content":"…","status":"in_progress"}]``.
+    Each ``content`` must be a **string** (not a list/object).
 
-    - ``merge=false`` (default): replace the entire list with a fresh plan.
-    - ``merge=true``: update existing items by ``id``, append new ones.
+    - ``merge=false`` (default): replace the entire list.
+    - ``merge=true``: update by ``id``, append new ids.
 
-    Each item: ``{id: string, content: string, status}`` where ``status`` is
-    ``pending`` | ``in_progress`` | ``completed`` | ``cancelled``.
+    Status: ``pending`` | ``in_progress`` | ``completed`` | ``cancelled``.
+    Order is priority. Only **one** ``in_progress`` at a time. Mark
+    ``completed`` as soon as a step finishes; on failure ``cancelled`` + add a
+    revised item with ``merge=true``.
 
-    List order is priority. Only **one** item should be ``in_progress`` at a
-    time. Mark items ``completed`` as soon as they finish. If a step fails,
-    mark it ``cancelled`` and add a revised item via ``merge=true``.
+    Do **not** put self-referential steps in ``content`` (e.g.「更新清单」「回复
+    用户」)—writes still succeed but return ``warnings[]`` (soft advisory).
 
-    Always returns the full current list and summary counts.
+    Always returns the full list and summary counts.
 
     Args:
         todos: JSON array of task items, or empty to read the current list.
@@ -50,24 +57,18 @@ async def todo(
     Returns:
         JSON with ok, session_id, todos[], summary{{total, pending, …}}, …
     """
-    raw = todos.strip()
-    if not raw:
+    if todos is None:
         result = await _store.read_todos(workspace_raw=workspace)
     else:
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            result = {
-                "ok": False,
-                "message": f"todos must be a JSON array: {exc}",
-            }
+        parsed: Any = todos
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError as exc:
+                result = {"ok": False, "message": f"todos must be a JSON array: {exc}"}
+                return json.dumps(result, ensure_ascii=False)
+        if not isinstance(parsed, list):
+            result = {"ok": False, "message": "todos must be a JSON array"}
         else:
-            if not isinstance(parsed, list):
-                result = {"ok": False, "message": "todos must be a JSON array"}
-            else:
-                result = await _store.write_todos(
-                    todos=parsed,
-                    merge=merge,
-                    workspace_raw=workspace,
-                )
+            result = await _store.write_todos(todos=parsed, merge=merge, workspace_raw=workspace)
     return json.dumps(result, ensure_ascii=False)

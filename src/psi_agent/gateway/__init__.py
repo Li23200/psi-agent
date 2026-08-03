@@ -17,9 +17,11 @@ from psi_agent.gateway._ai_manager import AIManager
 from psi_agent.gateway._attention import AttentionHub
 from psi_agent.gateway._defaults import resolve_appdata_root, resolve_default_agent, resolve_default_workspace
 from psi_agent.gateway._router_manager import RouterManager, RouterUpstreamInfo
+from psi_agent.gateway._scheduler_manager import SchedulerManager
 from psi_agent.gateway._session_manager import SessionManager
 from psi_agent.gateway._spa_shell import DEFAULT_APP_NAME
 from psi_agent.gateway._state import GatewayState
+from psi_agent.gateway._summary_manager import SummaryManager
 from psi_agent.gateway._title_manager import TitleManager
 from psi_agent.gateway._tray import GatewayTray
 from psi_agent.gateway._webview import GatewayWebView
@@ -43,7 +45,7 @@ class Gateway:
     """Listen address. Empty = random high port on 127.0.0.1."""
 
     socket_path: str = "psi"
-    """Prefix for AI/Session Unix socket paths."""
+    """Prefix for AI/Session socket paths (Unix sockets on POSIX, Named Pipes on Windows)."""
 
     icon: str | None = None
     """Path to icon image file (png/jpg/ico). Used as favicon, tray icon (--tray), and webview icon (--webview)."""
@@ -61,18 +63,20 @@ class Gateway:
     """Show a system tray icon (requires --icon)."""
 
     feishu_ai_id: str = ""
-    """飞书用户 Session 默认挂载的 AI 实例 id。飞书 channel 经 ``POST /feishu/route`` 按需为
-    每个飞书用户 spawn 独立 Session 时用它作缺省 AI (请求体也可逐次覆盖 ``ai_id``)。空 = 未配,
+    """飞书 Session 默认挂载的 AI 实例 id。飞书 channel 经 ``POST /feishu/route`` 按需为每个
+    飞书用户/群 spawn 独立 Session 时用它作缺省 AI (请求体也可逐次覆盖 ``ai_id``)。空 = 未配,
     此时若请求也不带 ``ai_id`` 则 ``/feishu/route`` 返回 400。"""
 
     feishu_workspace_root: str = ""
-    """飞书各用户独立 workspace 的父目录。每个 open_id 得到 ``<root>/<open_id>`` 子目录, 文件/历史
-    互相隔离。空 = 以 Gateway 进程 cwd 为父目录。"""
+    """飞书各会话独立 workspace 的父目录。私聊每个 open_id 得到 ``<root>/<open_id>`` 子目录,
+    群聊每个 chat_id 得到 ``<root>/chat-<chat_id>``, 文件/历史互相隔离。空 = 以 Gateway 进程
+    cwd 为父目录。"""
 
     default_agent: str = ""
-    """Step 2 CLI: default agent package for new Sessions / GET /defaults.
+    """CLI: default agent package for new Sessions / GET /defaults.
 
-    Empty → soft-default ``examples/haitun-workspace`` when present under cwd,
+    Empty → soft-default ``examples/haitun-workspace`` under cwd when present;
+    else cwd when it looks like an install layout (``tools/`` + ``skills/``);
     else Session keeps single-root compat (``agent=\"\"`` → same as workspace).
     """
 
@@ -91,6 +95,15 @@ class Gateway:
     Step 4B: todos write under ``{appdata}/todos/`` (legacy workspace path dual-read).
     Step 4C: history writes under ``{appdata}/histories/`` (legacy dual-read).
     Step 4D: Gateway ``state/`` under ``{appdata}/state/`` (legacy cwd dual-read).
+    """
+
+    scheduler_ai_id: str = ""
+    """调度 Session 挂载的 AI 实例 id。每个 workspace 会得到一个专用调度 Session
+    (对 SPA / state 隐藏), 以 ``active_schedules=("*",)`` 激活该 workspace 下的全部
+    定时任务 —— 定时任务从 workspace 加载, 但**触发权是 (session x schedule) 逐条的**,
+    一条必须恰好被一个 Session 激活, 否则飞书多用户下一条提醒会被在线会话数乘一遍。
+
+    空 = 回落 ``--feishu-ai-id``; 两者都空则不启动调度 Session (记 warning)。
     """
 
     verbose: bool = False
@@ -131,6 +144,7 @@ class Gateway:
                 _appdata=appdata_root,
             )
             tm = TitleManager()
+            sum_m = SummaryManager()
 
             for cfg in snapshot.get("ais", []):
                 try:
@@ -140,6 +154,7 @@ class Gateway:
                         api_key=cfg.get("api_key", ""),
                         base_url=cfg.get("base_url", ""),
                         id=cfg.get("id", ""),
+                        max_context_tokens=int(cfg.get("max_context_tokens", -1)),
                     )
                     logger.info(f"Restored AI {cfg.get('id', '?')!r}")
                 except Exception as e:
@@ -149,6 +164,7 @@ class Gateway:
                 try:
                     await rm.create(
                         name=cfg.get("name", ""),
+                        mode=cfg.get("mode", ""),
                         router_ai_id=cfg.get("router_ai_id", ""),
                         upstreams=[
                             RouterUpstreamInfo(item.get("ai_id", ""), item.get("description", ""))
@@ -156,7 +172,7 @@ class Gateway:
                         ],
                         default_ai_id=cfg.get("default_ai_id", ""),
                         router_timeout=cfg.get("router_timeout"),
-                        router_context_chars=cfg.get("router_context_chars", 12_000),
+                        max_context_length=cfg.get("max_context_length", 12_000),
                         id=cfg.get("id", ""),
                     )
                     logger.info(f"Restored Router {cfg.get('id', '?')!r}")
@@ -179,7 +195,11 @@ class Gateway:
             for t in snapshot.get("titles", []):
                 await tm.set(t["id"], t["title"])
 
+            for row in snapshot.get("summaries", []):
+                await sum_m.set(row["id"], row["summary"])
+
             attention = AttentionHub()
+            schedm = SchedulerManager(_sm=sm, _ai_id=self.scheduler_ai_id or self.feishu_ai_id)
             app = await create_app(
                 aim,
                 sm,
@@ -193,7 +213,15 @@ class Gateway:
                 default_agent=agent_default,
                 default_workspace=workspace_default,
                 appdata=appdata_root,
+                scheduler_ai_id=self.scheduler_ai_id,
+                schedm=schedm,
+                sum_m=sum_m,
             )
+
+            # Restored sessions need a scheduler Session for their workspace too
+            # (on demand: skipped when there are no schedules).
+            for info in await sm.list_all():
+                await schedm.ensure(info.workspace, ai_id=info.backend_id, agent=info.agent)
 
             async def _do_persist() -> None:
                 await state.save(
@@ -204,6 +232,7 @@ class Gateway:
                             "model": info.model,
                             "api_key": info.api_key,
                             "base_url": info.base_url,
+                            "max_context_tokens": info.max_context_tokens,
                         }
                         for info in await aim.list_all()
                     ],
@@ -218,17 +247,19 @@ class Gateway:
                         for info in await sm.list_all()
                     ],
                     titles=[{"id": sid, "title": title} for sid, title in tm.get_all().items()],
+                    summaries=[{"id": sid, "summary": text} for sid, text in sum_m.get_all().items()],
                     routers=[
                         {
                             "id": info.id,
                             "name": info.name,
+                            "mode": info.mode,
                             "router_ai_id": info.router_ai_id,
                             "upstreams": [
                                 {"ai_id": item.ai_id, "description": item.description} for item in info.upstreams
                             ],
                             "default_ai_id": info.default_ai_id,
                             "router_timeout": info.router_timeout,
-                            "router_context_chars": info.router_context_chars,
+                            "max_context_length": info.max_context_length,
                         }
                         for info in await rm.list_all()
                     ],
@@ -238,6 +269,7 @@ class Gateway:
             rm._persist = _do_persist
             sm._persist = _do_persist
             tm._persist = _do_persist
+            sum_m._persist = _do_persist
 
             await _do_persist()
 

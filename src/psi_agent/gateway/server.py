@@ -21,10 +21,13 @@ from psi_agent.gateway._defaults import (
 )
 from psi_agent.gateway._feishu_manager import FeishuManager
 from psi_agent.gateway._history_manager import HistoryManager
+from psi_agent.gateway._oauth_manager import OAuthRelay
 from psi_agent.gateway._openapi import render_openapi
 from psi_agent.gateway._router_manager import RouterManager, RouterUpstreamInfo
+from psi_agent.gateway._scheduler_manager import SchedulerManager
 from psi_agent.gateway._session_manager import SessionInfo, SessionManager
 from psi_agent.gateway._spa_shell import DEFAULT_APP_NAME, inject_app_name, read_spa_index_template
+from psi_agent.gateway._summary_manager import SummaryManager
 from psi_agent.gateway._title_manager import TitleManager
 from psi_agent.gateway._todo_manager import TodoManager
 from psi_agent.gateway._workspace_manager import WorkspaceManager
@@ -94,9 +97,14 @@ async def _handle_spa_index(request: web.Request) -> web.Response:
     return web.Response(text=body, content_type="text/html", charset="utf-8")
 
 
+def _gateway_spa_root() -> anyio.Path:
+    """Package dir that owns ``spa/`` and ``spa-v2/`` (tests may monkeypatch)."""
+    return anyio.Path(__file__).parent
+
+
 async def _handle_spa_v2_index(request: web.Request) -> web.Response:
     app_name: str = request.app["app_name"]
-    base = anyio.Path(__file__).parent / "spa-v2"
+    base = _gateway_spa_root() / "spa-v2"
     template: str | None = None
     for rel in ("dist/index.html", "index.html"):
         path = base / rel
@@ -139,6 +147,11 @@ def _session_data(info: SessionInfo) -> dict[str, Any]:
     data = asdict(info)
     if data.get("backend_type") == "ai":
         data["ai_id"] = data["backend_id"]
+    # ``scheduler`` is a property derived from active_schedules, so asdict omits
+    # it — add it back explicitly; the REST / SPA contract is unchanged.
+    data["active_schedules"] = list(info.active_schedules)
+    data["deactive_schedules"] = list(info.deactive_schedules)
+    data["scheduler"] = info.scheduler
     return data
 
 
@@ -155,13 +168,22 @@ async def create_app(
     default_agent: str = "",
     default_workspace: str = "",
     appdata: str = "",
+    scheduler_ai_id: str = "",
+    schedm: SchedulerManager | None = None,
+    sum_m: SummaryManager | None = None,
 ) -> web.Application:
     app = web.Application(client_max_size=100 * 1024 * 1024)
     app["aim"] = aim
     app["rm"] = rm
     app["sm"] = sm
     app["tm"] = tm
+    app["sum_m"] = sum_m if sum_m is not None else SummaryManager()
+    # Owns the scheduler Sessions: one per workspace, created on demand, hidden
+    # from SPA / state. Gateway.run passes its own instance (also needed by
+    # startup restore); standalone tests may omit it.
+    app["schedm"] = schedm or SchedulerManager(_sm=sm, _ai_id=scheduler_ai_id or feishu_ai_id)
     app["fm"] = FeishuManager(_sm=sm, _ai_id=feishu_ai_id, _workspace_root=feishu_workspace_root)
+    app["oauth"] = OAuthRelay()
     app["wm"] = WorkspaceManager()
     app["cm"] = ChatManager()
     app["hm"] = HistoryManager()
@@ -173,21 +195,24 @@ async def create_app(
     app["default_workspace"] = default_workspace
     app["appdata"] = appdata
 
-    spa_dist = anyio.Path(__file__).parent / "spa" / "dist"
-    spa_v2_dist = anyio.Path(__file__).parent / "spa-v2" / "dist"
+    spa_root = _gateway_spa_root()
+    spa_dist = spa_root / "spa" / "dist"
+    spa_v2_dist = spa_root / "spa-v2" / "dist"
+    # Register directory redirects before add_static: aiohttp matches static
+    # ``/spa-v2/`` first when registered earlier, and show_index=False → 403.
     app.router.add_get("/spa/index.html", _handle_spa_index)
-    if await spa_dist.exists():
-        app.router.add_static("/spa/", str(spa_dist), show_index=False)
     app.router.add_get("/spa", _handle_spa)
     app.router.add_get("/spa/", _handle_spa)
+    if await spa_dist.exists():
+        app.router.add_static("/spa/", str(spa_dist), show_index=False)
 
     app.router.add_get("/spa-v2/index.html", _handle_spa_v2_index)
     if await spa_v2_dist.exists():
-        app.router.add_static("/spa-v2/", str(spa_v2_dist), show_index=False)
         logger.info(f"SPA v2 (default) enabled, serving {spa_v2_dist}")
         app.router.add_get("/", _handle_spa_v2)
         app.router.add_get("/spa-v2", _handle_spa_v2)
         app.router.add_get("/spa-v2/", _handle_spa_v2)
+        app.router.add_static("/spa-v2/", str(spa_v2_dist), show_index=False)
     else:
         app.router.add_get("/", _handle_spa)
     if favicon_path is not None:
@@ -206,17 +231,26 @@ async def create_app(
     app.router.add_get("/titles", _list_titles)
     app.router.add_post("/titles", _set_title)
     app.router.add_post("/titles/generate", _generate_title)
+    app.router.add_get("/summaries", _list_summaries)
+    app.router.add_post("/summaries", _set_summary)
+    app.router.add_post("/summaries/generate", _generate_summary)
     app.router.add_post("/ui/attention", _request_attention)
     app.router.add_get("/workspace/cwd", _get_cwd)
     app.router.add_get("/defaults", _get_defaults)
     app.router.add_get("/workspace/places", _list_workspace_places)
     app.router.add_get("/workspace/browse", _browse_workspace)
     app.router.add_get("/workspace/file", _read_workspace_file)
+    app.router.add_post("/workspace/reveal", _reveal_workspace_path)
     app.router.add_get("/sessions/{session_id}/history", _get_history)
     app.router.add_get("/sessions/{session_id}/todos", _get_todos)
+    app.router.add_get("/sessions/{session_id}/todo-segments", _list_todo_segments)
+    app.router.add_get("/sessions/{session_id}/todo-segments/{segment_id}", _get_todo_segment)
+    app.router.add_post("/sessions/{session_id}/todo-segments/{segment_id}", _set_todo_segment_label)
     app.router.add_post("/sessions/{session_id}/chat", _handle_chat)
     app.router.add_post("/feishu/route", _feishu_route)
     app.router.add_get("/feishu/routes", _list_feishu_routes)
+    app.router.add_get("/oauth/callback", _oauth_callback)
+    app.router.add_get("/oauth/code", _oauth_take_code)
 
     return app
 
@@ -231,6 +265,7 @@ async def _create_ai(request: web.Request) -> web.Response:
             api_key=body["api_key"],
             base_url=body["base_url"],
             id=body.get("id", ""),
+            max_context_tokens=int(body.get("max_context_tokens", -1)),
         )
         return _json(asdict(info), status=201)
     except (TypeError, ValueError, KeyError) as e:
@@ -266,11 +301,12 @@ async def _create_router(request: web.Request) -> web.Response:
         body = await request.json()
         info = await rm.create(
             name=body["name"],
+            mode=body["mode"],
             router_ai_id=body["router_ai_id"],
             upstreams=[RouterUpstreamInfo(item["ai_id"], item["description"]) for item in body["upstreams"]],
             default_ai_id=body["default_ai_id"],
             router_timeout=body.get("router_timeout"),
-            router_context_chars=body.get("router_context_chars", 12_000),
+            max_context_length=body.get("max_context_length", 12_000),
             id=body.get("id", ""),
         )
         return _json(asdict(info), status=201)
@@ -306,6 +342,7 @@ async def _list_routers(request: web.Request) -> web.Response:
 async def _create_session(request: web.Request) -> web.Response:
     """POST /sessions — Step 2 accepts optional ``agent`` (else Gateway default)."""
     sm: SessionManager = request.app["sm"]
+    schedm: SchedulerManager = request.app["schedm"]
     try:
         body = await request.json()
         backend_type = body.get("backend_type", "ai")
@@ -317,6 +354,9 @@ async def _create_session(request: web.Request) -> web.Response:
             workspace=body.get("workspace", ""),
             agent=body.get("agent", ""),
         )
+        # This workspace's schedules are owned by its dedicated scheduler
+        # Session, not fired by this session.
+        await schedm.ensure(info.workspace, ai_id=info.backend_id, agent=info.agent)
         return _json(_session_data(info), status=201)
     except (TypeError, ValueError, KeyError) as e:
         return _error(str(e), status=400)
@@ -331,6 +371,7 @@ async def _delete_session(request: web.Request) -> web.Response:
     sm: SessionManager = request.app["sm"]
     hm: HistoryManager = request.app["hm"]
     tm: TitleManager = request.app["tm"]
+    sum_m: SummaryManager = request.app["sum_m"]
     session_id = request.match_info["session_id"]
     try:
         workspace = sm.get_workspace(session_id)
@@ -338,6 +379,7 @@ async def _delete_session(request: web.Request) -> web.Response:
         appdata = str(request.app.get("appdata") or "")
         await hm.delete(workspace, session_id, appdata=appdata)
         await tm.delete(session_id)
+        await sum_m.delete(session_id)
         return _json({"id": session_id, "status": "stopped"})
     except LookupError as e:
         return _error(str(e), status=404)
@@ -352,22 +394,46 @@ async def _list_sessions(request: web.Request) -> web.Response:
 
 
 async def _feishu_route(request: web.Request) -> web.Response:
-    """按飞书 ``open_id`` 幂等地路由到其独立 Session, 首次见到时按需 spawn。
+    """幂等地把一次飞书会话路由到其 Session, 首次见到时按需 spawn。
 
-    body: ``{open_id, ai_id?, workspace?}`` → ``201 {open_id, session_id, channel_socket}``。
-    channel 拿回 ``channel_socket`` 连接即得该用户隔离的会话。
+    body: ``{open_id, chat_id?, chat_type?, ai_id?, workspace?}`` →
+    ``201 {open_id, chat_id, session_id, channel_socket}``。群聊 (``chat_type`` 为 group/topic
+    且 ``chat_id`` 非空) 整群共用一个 Session, 其余按 ``open_id`` 一人一个。channel 拿回
+    ``channel_socket`` 连接即得对应会话。
     """
     fm: FeishuManager = request.app["fm"]
+    schedm: SchedulerManager = request.app["schedm"]
     try:
         body = await request.json()
         if not isinstance(body, dict):
             return _error("Request body must be a JSON object", status=400)
+        open_id = body.get("open_id") or ""
+        chat_id = body.get("chat_id") or ""
+        chat_type = body.get("chat_type") or ""
         socket, session_id = await fm.route(
-            body["open_id"],
+            open_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
             ai_id=body.get("ai_id"),
             workspace=body.get("workspace"),
         )
-        return _json({"open_id": body["open_id"], "session_id": session_id, "channel_socket": socket}, status=201)
+        # Schedules under this session's workspace belong to its dedicated scheduler
+        # Session, not to the user/group session.
+        sm: SessionManager = request.app["sm"]
+        await schedm.ensure(
+            sm.get_workspace(session_id),
+            ai_id=sm.get_backend_id(session_id),
+            agent=sm.get_agent(session_id),
+        )
+        return _json(
+            {
+                "open_id": open_id,
+                "chat_id": chat_id,
+                "session_id": session_id,
+                "channel_socket": socket,
+            },
+            status=201,
+        )
     except (TypeError, ValueError, KeyError) as e:
         return _error(str(e), status=400)
     except LookupError as e:
@@ -380,6 +446,56 @@ async def _feishu_route(request: web.Request) -> web.Response:
 async def _list_feishu_routes(request: web.Request) -> web.Response:
     fm: FeishuManager = request.app["fm"]
     return _json([asdict(r) for r in fm.list_routes()])
+
+
+_OAUTH_DONE_HTML = (
+    "<!doctype html><meta charset=utf-8><title>授权完成</title>"
+    "<body style='font:16px/1.7 system-ui;padding:3rem;text-align:center'>"
+    "<h2>{title}</h2><p style='color:#666'>{note}</p></body>"
+)
+
+
+def _oauth_html(title: str, note: str, status: int = 200) -> web.Response:
+    return web.Response(
+        text=_OAUTH_DONE_HTML.format(title=title, note=note),
+        content_type="text/html",
+        charset="utf-8",
+        status=status,
+    )
+
+
+async def _oauth_callback(request: web.Request) -> web.Response:
+    """OAuth 重定向落地点: 收下 ``?code=&state=`` 交给中继, 给用户一个成功页。
+
+    发起方(workspace 工具)随后用同一个 ``state`` 去 ``/oauth/code`` 取回 —— 用户
+    因此**不需要**再从地址栏手工复制 code。
+    """
+    relay: OAuthRelay = request.app["oauth"]
+    state = request.query.get("state", "")
+    code = request.query.get("code", "")
+    error = request.query.get("error", "") or request.query.get("error_description", "")
+    if not state:
+        return _oauth_html("授权链接不完整", "回调缺少 state 参数, 请回到对话里重新发起授权。", status=400)
+    if not code and not error:
+        error = "callback carried neither code nor error"
+    await relay.deliver(state, code=code, error=error)
+    if error:
+        return _oauth_html("授权未完成", "可以回到对话里重新发起授权。", status=400)
+    return _oauth_html("授权成功 ✅", "可以关掉这个页面, 回到对话继续 —— 不用复制任何东西。")
+
+
+async def _oauth_take_code(request: web.Request) -> web.Response:
+    """发起方取件: ``?state=`` 命中则返回 ``{code}`` 并作废, 未到达返回 404。"""
+    relay: OAuthRelay = request.app["oauth"]
+    state = request.query.get("state", "")
+    if not state:
+        return _error("state query parameter is required", status=400)
+    pending = await relay.take(state)
+    if pending is None:
+        return _error("no callback received for this state yet", status=404)
+    if pending.error:
+        return _json({"state": state, "error": pending.error}, status=200)
+    return _json({"state": state, "code": pending.code}, status=200)
 
 
 async def _list_titles(request: web.Request) -> web.Response:
@@ -401,9 +517,23 @@ async def _set_title(request: web.Request) -> web.Response:
         return _error(str(e), status=500)
 
 
-async def _generate_title(request: web.Request) -> web.Response:
+async def _session_ai_socket(request: web.Request, sid: str) -> str:
+    """Resolve the AI socket used for title/summary generation for *sid*."""
     aim: AIManager = request.app["aim"]
     sm: SessionManager = request.app["sm"]
+    sessions = await sm.list_all()
+    sess = next((s for s in sessions if s.id == sid), None)
+    if not sess:
+        raise LookupError("Session not found")
+    if sess.backend_type == "ai":
+        return aim.get_socket(sess.backend_id)
+    rm: RouterManager | None = request.app["rm"]
+    if rm is None:
+        raise LookupError("Router manager is not configured")
+    return aim.get_socket(rm.get(sess.backend_id).default_ai_id)
+
+
+async def _generate_title(request: web.Request) -> web.Response:
     tm: TitleManager = request.app["tm"]
     try:
         body = await request.json()
@@ -414,17 +544,7 @@ async def _generate_title(request: web.Request) -> web.Response:
         return _error(str(e), status=400)
 
     try:
-        sessions = await sm.list_all()
-        sess = next((s for s in sessions if s.id == sid), None)
-        if not sess:
-            return _error("Session not found", status=404)
-        if sess.backend_type == "ai":
-            ai_socket = aim.get_socket(sess.backend_id)
-        else:
-            rm: RouterManager | None = request.app["rm"]
-            if rm is None:
-                raise LookupError("Router manager is not configured")
-            ai_socket = aim.get_socket(rm.get(sess.backend_id).default_ai_id)
+        ai_socket = await _session_ai_socket(request, sid)
     except LookupError as e:
         return _error(str(e), status=404)
 
@@ -433,6 +553,47 @@ async def _generate_title(request: web.Request) -> web.Response:
         return _json({"id": sid, "title": title})
     logger.warning(f"Title generation returned no result for session {sid!r}")
     return _error("Failed to generate title", status=500)
+
+
+async def _list_summaries(request: web.Request) -> web.Response:
+    sum_m: SummaryManager = request.app["sum_m"]
+    return _json(sum_m.get_all())
+
+
+async def _set_summary(request: web.Request) -> web.Response:
+    sum_m: SummaryManager = request.app["sum_m"]
+    try:
+        body = await request.json()
+        sid = body["id"]
+        await sum_m.set(sid, body["summary"])
+        return _json({"id": sid, "summary": body["summary"]})
+    except (KeyError, TypeError) as e:
+        return _error(str(e), status=400)
+    except Exception as e:
+        logger.error(f"Unexpected error setting summary: {e!r}")
+        return _error(str(e), status=500)
+
+
+async def _generate_summary(request: web.Request) -> web.Response:
+    sum_m: SummaryManager = request.app["sum_m"]
+    try:
+        body = await request.json()
+        sid = body["id"]
+        user_text = body.get("user_text", "")
+        assistant_text = body.get("assistant_text", "")
+    except (KeyError, TypeError) as e:
+        return _error(str(e), status=400)
+
+    try:
+        ai_socket = await _session_ai_socket(request, sid)
+    except LookupError as e:
+        return _error(str(e), status=404)
+
+    summary = await sum_m.generate(sid, ai_socket, user_text, assistant_text)
+    if summary:
+        return _json({"id": sid, "summary": summary})
+    logger.warning(f"Summary generation returned no result for session {sid!r}")
+    return _error("Failed to generate summary", status=500)
 
 
 async def _get_cwd(request: web.Request) -> web.Response:
@@ -486,6 +647,28 @@ async def _read_workspace_file(request: web.Request) -> web.Response:
         return _error(str(e), status=400)
 
 
+async def _reveal_workspace_path(request: web.Request) -> web.Response:
+    """POST /workspace/reveal — open OS file manager at path (select file if possible)."""
+    wm: WorkspaceManager = request.app["wm"]
+    try:
+        body = await request.json()
+    except Exception:
+        return _error("Invalid JSON body", status=400)
+    if not isinstance(body, dict):
+        return _error("Body must be a JSON object", status=400)
+    path = body.get("path")
+    if not isinstance(path, str):
+        return _error("path is required", status=400)
+    try:
+        return _json(await wm.reveal(path))
+    except ValueError as e:
+        return _error(str(e), status=400)
+    except FileNotFoundError as e:
+        return _error(str(e), status=404)
+    except OSError as e:
+        return _error(str(e), status=400)
+
+
 async def _get_history(request: web.Request) -> web.Response:
     sm: SessionManager = request.app["sm"]
     hm: HistoryManager = request.app["hm"]
@@ -509,6 +692,56 @@ async def _get_todos(request: web.Request) -> web.Response:
         return _error(f"Session '{session_id}' not found", status=404)
     appdata = str(request.app.get("appdata") or "")
     return _json(await todom.get(workspace, session_id, appdata=appdata))
+
+
+async def _list_todo_segments(request: web.Request) -> web.Response:
+    """List todo sub-task segments for a session (newest first)."""
+    sm: SessionManager = request.app["sm"]
+    todom: TodoManager = request.app["todom"]
+    session_id = request.match_info["session_id"]
+    if not sm.has(session_id):
+        return _error(f"Session '{session_id}' not found", status=404)
+    appdata = str(request.app.get("appdata") or "")
+    return _json(await todom.list_segments(session_id, appdata=appdata))
+
+
+async def _get_todo_segment(request: web.Request) -> web.Response:
+    """Get one todo segment including todos[]."""
+    sm: SessionManager = request.app["sm"]
+    todom: TodoManager = request.app["todom"]
+    session_id = request.match_info["session_id"]
+    segment_id = request.match_info["segment_id"]
+    if not sm.has(session_id):
+        return _error(f"Session '{session_id}' not found", status=404)
+    appdata = str(request.app.get("appdata") or "")
+    seg = await todom.get_segment(session_id, segment_id, appdata=appdata)
+    if seg is None:
+        return _error(f"Todo segment '{segment_id}' not found", status=404)
+    return _json(seg)
+
+
+async def _set_todo_segment_label(request: web.Request) -> web.Response:
+    """P1: patch segment label (e.g. from turn summary). Body: {label}."""
+    sm: SessionManager = request.app["sm"]
+    todom: TodoManager = request.app["todom"]
+    session_id = request.match_info["session_id"]
+    segment_id = request.match_info["segment_id"]
+    if not sm.has(session_id):
+        return _error(f"Session '{session_id}' not found", status=404)
+    try:
+        body = await request.json()
+    except (ValueError, TypeError) as e:
+        return _error(f"Invalid request: {e}", status=400)
+    if not isinstance(body, dict):
+        return _error("Request body must be a JSON object", status=400)
+    label = body.get("label")
+    if not isinstance(label, str) or not label.strip():
+        return _error("label is required", status=400)
+    appdata = str(request.app.get("appdata") or "")
+    seg = await todom.set_segment_label(session_id, segment_id, label, appdata=appdata)
+    if seg is None:
+        return _error(f"Todo segment '{segment_id}' not found", status=404)
+    return _json(seg)
 
 
 async def _handle_chat(request: web.Request) -> web.StreamResponse:

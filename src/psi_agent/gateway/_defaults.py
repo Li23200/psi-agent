@@ -12,9 +12,14 @@ import). This module re-exports them for existing Gateway / tool call sites.
 
 Soft default (agent)
 --------------------
-If CLI ``--default-agent`` is empty and ``examples/haitun-workspace`` exists
-under cwd, that directory is used so repo-local Gateway open-and-use works.
-Otherwise agent stays ``\"\"`` → Session single-root compat (agent ≡ workspace).
+If CLI ``--default-agent`` is empty:
+
+1. Prefer ``cwd/examples/haitun-workspace`` when present (repo-local Gateway).
+2. Else if *cwd itself* looks like a haitun agent package (``tools/`` + ``skills/``
+   directories) — the Inno install layout, where ``{app}`` *is* the workspace —
+   use cwd. This keeps ``psi-agent.exe gateway`` usable from the install dir
+   even without the ``haitun.exe`` launcher flags.
+3. Otherwise agent stays ``\"\"`` → Session single-root compat (agent ≡ workspace).
 
 Soft default (workspace)
 ------------------------
@@ -35,6 +40,7 @@ from psi_agent._appdata import (
     appdata_state_dir,
     appdata_state_latest_path,
     appdata_todo_path,
+    appdata_todo_segments_path,
     legacy_history_path,
     legacy_state_latest_path,
     legacy_todo_path,
@@ -53,6 +59,7 @@ __all__ = [
     "appdata_state_dir",
     "appdata_state_latest_path",
     "appdata_todo_path",
+    "appdata_todo_segments_path",
     "ensure_workspace_dir",
     "legacy_history_path",
     "legacy_state_latest_path",
@@ -100,8 +107,13 @@ async def resolve_default_agent(explicit: str = "") -> str:
     raw = explicit.strip()
     if raw:
         return str(await anyio.Path(raw).resolve())
+    cwd = await anyio.Path.cwd()
     # Soft default for developers who start Gateway from the repo root.
-    candidate = (await anyio.Path.cwd()) / "examples" / "haitun-workspace"
+    candidate = cwd / "examples" / "haitun-workspace"
     if await candidate.is_dir():
         return str(await candidate.resolve())
+    # Soft default for Windows install layout: {app} IS haitun-workspace
+    # (tools/ + skills/ at cwd; no examples/ nesting).
+    if await (cwd / "tools").is_dir() and await (cwd / "skills").is_dir():
+        return str(await cwd.resolve())
     return ""

@@ -76,7 +76,7 @@ payload 构造位于 `routerConfig.js`，AI/Router backend 显示逻辑位于
 
 ## 打开即用（远程默认 AI）
 
-空 AI 池时 **不要**在启动时 POST 默认模型——必须先打开 Hub 模型池，让用户选择「连接自有 API」或「使用免费模型」。「使用免费模型」= `clearAiPool()` 清空本地 AI 配置（池保持为空）；真正需要对话/新建会话时，再由 `ensureDefaultAi()` 惰性 `POST /ais` 挂上远程默认（公司域名 `https://misakamikoto.genuineknowledge.cn` / `deepseek-v4-flash-free`；占位 key `haitun-default`）。Gateway AI 把该 `base_url` 原样交给 any-llm（`api_base`），请求上游 `{base_url}/chat/completions`。真正的 upstream（当前为 OpenCode Zen）与 API key **只在公司域名所在 VM 的 Nginx 注入**，不进 SPA / 安装包。Gateway **不**提供 `/ais/bootstrap` 或内置默认 AI。
+空 AI 池时 **不要**在启动时 POST 默认模型——必须先打开 Hub 模型池，让用户选择「连接自有 API」或「使用免费模型」。「使用免费模型」= `clearAiPool()` 清空本地 AI 配置（池保持为空）；真正需要对话/新建会话时，再由 `ensureDefaultAi()` 惰性 `POST /ais` 挂上远程默认（公司域名 `https://misakamikoto.genuineknowledge.cn` / `deepseek-v4-flash`，与 Hub DeepSeek 预设一致；占位 key `haitun-default`）。Gateway AI 把该 `base_url` 原样交给 any-llm（`api_base`），请求上游 `{base_url}/chat/completions`。真正的 upstream（当前为 OpenCode Zen）与 API key **只在公司域名所在 VM 的 Nginx 注入**，不进 SPA / 安装包。Gateway **不**提供 `/ais/bootstrap` 或内置默认 AI。
 
 ## 目录结构
 
@@ -326,6 +326,7 @@ App.vue 是**编排层**：负责跨组件事件处理、弹窗控制、drag-dro
 - `marked.parse()` 失败时降级为 `htmlEscape()` 纯文本
 - **代码块语法高亮**：`marked` 的 `code` renderer 被覆盖，用 `highlight.js/lib/common`（仅常用语言，控制体积）产出带 `hljs language-xxx` class 的 `<pre><code>`；语言标注无效或高亮抛错时回退纯转义文本，绝不丢内容。着色由 `styles/highlight.css` 承担（双主题，`--hl-*` 变量映射 hljs token class，调色只改该文件）。内联代码不高亮，仅由 MessageBubble 的 `<style scoped>` 加浅背景片区分
 - **GFM 表格**：`utils.js` 已开 `gfm: true`，并在 `renderMd` 前做表格规范化（去掉表格块内空行、解开误包在 code fence 里的纯表格）；自定义 `table` renderer 包一层 `.md-table-card` 工具栏（复制 TSV / 下载 `.xlsx`，逻辑在 `mdTable.js`，点击由 `MessageBubble` 事件委托处理）；表格 `width:100%` + `table-layout:fixed`，单元格自动换行
+- **超链接新标签页（刻意为之）**：`renderMd` 的 `link` renderer 给 Markdown / autolink 的 `<a>` 加 `target="_blank" rel="noopener noreferrer"`，避免覆盖控制台。附件 chip / `FilePreview` 走按钮与抽屉，**不是** Markdown `<a>`，仍本页预览
 - **助手气泡排版**：`MessageBubble` 内增大行高/字距，并拉开标题与段落、列表间距（参考常见 Agent 正文节奏），用户气泡仍 `pre-wrap`
 
 ## SSE 流式解析 (`useSSE.js:readSSE`)

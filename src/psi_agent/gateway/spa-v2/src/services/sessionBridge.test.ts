@@ -46,6 +46,24 @@ describe('historyToChat', () => {
     ])
   })
 
+  it('attaches file stubs from sends for reload preview', () => {
+    expect(
+      historyToChat([
+        {
+          role: 'assistant',
+          text: '写好了',
+          sends: ['/ws/reports/out.md', '/ws/reports/out.md'],
+        },
+      ]),
+    ).toEqual([
+      {
+        role: 'agent',
+        text: '写好了',
+        files: [{ name: 'out.md', data: '', path: '/ws/reports/out.md' }],
+      },
+    ])
+  })
+
   it('drops schedule.silent and empty rows', () => {
     expect(
       historyToChat([
@@ -58,6 +76,87 @@ describe('historyToChat', () => {
     ).toEqual([
       { role: 'agent', text: '日报' },
       { role: 'user', text: '你好' },
+    ])
+  })
+
+  it('coalesces consecutive assistant rows from tool rounds into one bubble', () => {
+    expect(
+      historyToChat([
+        { role: 'user', text: '做剧本杀包' },
+        { role: 'assistant', text: 'Step 2 ✅ 开场与规则说明' },
+        { role: 'assistant', text: 'Step 3 ✅ 角色卡对照表' },
+        {
+          role: 'assistant',
+          text: 'Step 4 ✅ 生成 .docx 并交付',
+          sends: ['/ws/pack.docx'],
+        },
+        {
+          role: 'assistant',
+          text: 'write_word 的工具结果和实际写入不一致，我直接用 Python 生成文件。',
+        },
+        { role: 'user', text: '再改一版' },
+        { role: 'assistant', text: '好的' },
+      ]),
+    ).toEqual([
+      { role: 'user', text: '做剧本杀包' },
+      {
+        role: 'agent',
+        text: [
+          'Step 2 ✅ 开场与规则说明',
+          'Step 3 ✅ 角色卡对照表',
+          'Step 4 ✅ 生成 .docx 并交付',
+          'write_word 的工具结果和实际写入不一致，我直接用 Python 生成文件。',
+        ].join('\n\n'),
+        files: [{ name: 'pack.docx', data: '', path: '/ws/pack.docx' }],
+      },
+      { role: 'user', text: '再改一版' },
+      { role: 'agent', text: '好的' },
+    ])
+  })
+
+  it('merges consecutive assistant reasoning for expandable thinking', () => {
+    expect(
+      historyToChat([
+        {
+          role: 'assistant',
+          text: 'Step 1',
+          reasoning: '先读文件',
+        },
+        {
+          role: 'assistant',
+          text: '最终回复',
+          reasoning: '再总结',
+        },
+      ]),
+    ).toEqual([
+      {
+        role: 'agent',
+        text: 'Step 1\n\n最终回复',
+        reasoning: '先读文件\n再总结',
+      },
+    ])
+  })
+
+  it('maps structured tools separately from reasoning', () => {
+    expect(
+      historyToChat([
+        {
+          role: 'assistant',
+          text: '完成了',
+          reasoning: '先列目录再读文件',
+          tools: [
+            { name: 'list_dir', arguments: '{"path": "."}' },
+            { name: 'read', arguments: '{"path": "a.md"}' },
+          ],
+        },
+      ]),
+    ).toEqual([
+      {
+        role: 'agent',
+        text: '完成了',
+        reasoning: '先列目录再读文件',
+        tools: ['浏览 `.`', '读取 `a.md`'],
+      },
     ])
   })
 })
@@ -78,13 +177,15 @@ describe('historyToDeliverables', () => {
 })
 
 describe('withTodoProgress (via layered resolver)', () => {
-  it('streaming without todos → 推进中', () => {
+  it('streaming without todos → 正在处理 (activity)', () => {
     const next = withTodoProgress(baseTask(), [], { streaming: true, turnSettled: false })
     expect(next.phase).toBe('advance')
-    expect(next.steps[1]?.label).toBe('推进中')
+    expect(next.hasTodoTrack).toBe(false)
+    expect(next.progressIndeterminate).toBe(true)
+    expect(next.steps).toEqual([{ label: '正在处理', state: 'working' }])
   })
 
-  it('maps todo in_progress to N/M', () => {
+  it('maps todo in_progress to checklist + N/M', () => {
     const next = withTodoProgress(
       baseTask(),
       [
@@ -96,11 +197,13 @@ describe('withTodoProgress (via layered resolver)', () => {
       { streaming: true, turnSettled: false },
     )
     expect(next.phase).toBe('advance')
-    expect(next.steps[1]).toEqual({
-      label: '2/3',
-      state: 'working',
-      detail: '写方案',
-    })
+    expect(next.hasTodoTrack).toBe(true)
+    expect(next.progressLabel).toBe('2/3')
+    expect(next.steps).toEqual([
+      { label: '调研', state: 'done' },
+      { label: '写方案', state: 'working' },
+      { label: '评审', state: 'waiting' },
+    ])
     expect(next.progress).toBe(33)
   })
 
@@ -114,7 +217,8 @@ describe('withTodoProgress (via layered resolver)', () => {
       { streaming: true, turnSettled: false },
     )
     expect(next.phase).toBe('deliver')
-    expect(next.steps[2]?.state).toBe('working')
+    expect(next.steps.at(-1)?.state).toBe('working')
+    expect(next.steps.at(-1)?.label).toBe('产出与确认')
   })
 })
 

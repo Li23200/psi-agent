@@ -4,16 +4,17 @@
 
 This merges three ideas into one workspace:
 
-* An OpenClaw-style prompt engine (stable prefix + cache boundary + dynamic
-  suffix, skills index, bootstrap context files) - **de-branded**, with **all
+* An OpenClaw-style prompt engine (layered builder + a per-turn context block,
+  skills index, bootstrap context files) - **de-branded**, with **all
   configuration kept inside the workspace** (there is no global config dir).
 * The Fusion Flow authoring capability (flows index + authoring guidance),
   fully merged from the fusion-flow workspace.
 * A fixed Haitun agent persona, always stated in the system prompt.
 
-Only ``system_prompt_builder()`` (and optionally ``system_prompt_rebuild_checker``)
-is invoked by psi-agent's session loader.  ``compact_history`` / ``after_turn`` /
-the self-evolution helpers below are **intentionally kept but currently un-wired**
+``system_prompt_builder()``, ``system_prompt_rebuild_checker()``,
+``turn_context_builder()``, ``compact_history()``, and ``system_after_turn()``
+are invoked by psi-agent's session loader. ``System.after_turn`` and the
+self-evolution helpers below are **intentionally kept but currently un-wired**
 - they are future-extension hooks (see AGENTS.md).  Do not delete them as "dead
 code"; they exist on purpose.
 """
@@ -29,8 +30,13 @@ _THIS_DIR = _os.path.dirname(_os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
+_TOOLS_DIR = _os.path.join(_os.path.dirname(_THIS_DIR), "tools")
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
 import contextlib
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -38,7 +44,7 @@ import platform
 import re
 import types
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -74,6 +80,7 @@ from prompt_sections import (
     SILENT_REPLIES_SECTION,
     SILENT_TOKEN,
     SESSION_MANAGEMENT_SECTION,
+    SKILL_AUTHORING_SECTION,
     SYSTEM_CLI_TOOLS_SECTION,
     STRUCTURED_TABLES_SECTION,
     TASK_PLANNING_SECTION,
@@ -91,7 +98,12 @@ from prompt_sections import (
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_OK = "HEARTBEAT_OK"
-CACHE_BOUNDARY = "\n<!-- HAITUN_CACHE_BOUNDARY -->\n"
+
+# Last-seen digest of the per-turn context files, keyed by workspace — drives
+# ``system_prompt_rebuild_checker``. Process-wide: Gateway runs many Sessions in
+# one process and they read the same files, and the worst a shared entry costs
+# is one extra rebuild for a Session that had already picked the change up.
+_CONTEXT_FILE_DIGESTS: dict[str, str] = {}
 
 # Skill whose presence injects the ## Help guidance section.
 HELP_SKILL_NAME = "psi-agent-help"
@@ -101,6 +113,8 @@ _USER_MD_MAX_CHARS = 10_000
 _CONTEXT_FILE_MAX_CHARS = 40_000
 
 _SKILLS_SNAPSHOT_FILE = ".skills_prompt_snapshot.json"
+
+_SUPERVISOR_MANAGERS: dict[str, Any] = {}
 
 # Global skills directory, shared across workspaces (AGENTS.md ecosystem
 # convention). Each skill lives at ~/.agent/skills/<name>/SKILL.md, mirroring
@@ -681,6 +695,39 @@ def _build_runtime_info(model: str | None) -> str:
     )
 
 
+_WEEKDAY_ZH = ("一", "二", "三", "四", "五", "六", "日")
+
+_CALENDAR_DAYS = 8
+
+
+def _weekday_label(day: date) -> str:
+    """Render one day as ``2026-08-03 Monday 周一`` — computed, never inferred."""
+    return f"{day.strftime('%Y-%m-%d')} {day.strftime('%A')} 周{_WEEKDAY_ZH[day.weekday()]}"
+
+
+def _build_calendar_lines(today: date) -> list[str]:
+    """Lay out today plus the next week as an explicit date→weekday table.
+
+    刻意为之: users say "周一晚上" / "下周二", never "2026-08-03". Resolving that
+    to a date is calendar arithmetic, which an LLM does by recall rather than by
+    calculation and therefore gets wrong — the bug this exists to kill had the
+    agent call 2026-08-03 a Sunday, then a Monday one turn later. A table it can
+    read a row out of removes the arithmetic entirely. Yesterday is included
+    because "昨天/上周X" references land there.
+    """
+    lines = [f"- {_weekday_label(today - timedelta(days=1))} (yesterday)"]
+    for offset in range(_CALENDAR_DAYS):
+        day = today + timedelta(days=offset)
+        if offset == 0:
+            suffix = " (TODAY)"
+        elif offset == 1:
+            suffix = " (tomorrow)"
+        else:
+            suffix = ""
+        lines.append(f"- {_weekday_label(day)}{suffix}")
+    return lines
+
+
 def _build_datetime_section() -> str:
     """Build the ## Current Date & Time section.
 
@@ -695,6 +742,13 @@ def _build_datetime_section() -> str:
     the agent a time that is off by the UTC offset. When TZ is unset or
     invalid, fall back to the system's local timezone via astimezone(),
     so no tzdata package is strictly required.
+
+    The weekday of *today* and of the surrounding week are printed, not left
+    to the model: see ``_build_calendar_lines``. The heading also marks the
+    block as belonging to the turn being built, because every past turn keeps
+    the block it was sent with (see ``SystemPrompt.turn_context``) — a
+    conversation that spans midnight otherwise carries several equally
+    plausible ``Date:`` lines with nothing to say which one is now.
     """
     tz_name = os.environ.get("TZ", "").strip()
     try:
@@ -718,8 +772,12 @@ def _build_datetime_section() -> str:
             "recently as possibly stale and verify online."
         )
     return (
-        f"## Current Date & Time\nDate: {now.strftime('%Y-%m-%d')}\n"
-        f"Time: {now.strftime('%H:%M:%S')}\nTime zone: {tz_name}\n{cutoff_line}"
+        "## Current Date & Time (THIS TURN — authoritative; ignore any earlier "
+        "Date/Time block in this conversation)\n"
+        f"Date: {_weekday_label(now.date())}\n"
+        f"Time: {now.strftime('%H:%M:%S')}\nTime zone: {tz_name}\n{cutoff_line}\n"
+        "\nCalendar (read the weekday off this table — do not compute it):\n"
+        + "\n".join(_build_calendar_lines(now.date()))
     )
 
 
@@ -747,7 +805,7 @@ async def _scan_tool_names(workspace_dir: anyio.Path) -> list[str]:
 
 
 async def _build_dynamic_context_files(workspace_dir: anyio.Path) -> str:
-    """Read dynamic context files (heartbeat.md) below the cache boundary."""
+    """Read dynamic context files (heartbeat.md) for the system prompt."""
     parts: list[str] = []
     dynamic_names_lower = {n.lower() for n in DYNAMIC_CONTEXT_FILE_BASENAMES}
     async for entry in workspace_dir.iterdir():
@@ -967,10 +1025,13 @@ workspace. Never silently rewrite user-authored assets.
 
 Rules:
 1. Keep `skills/fusion-flow/` immutable - it is the runtime bundle, not a generated skill.
-2. Treat skills without `created_by: agent` as read-only.
-3. New learned procedures -> `skills/<skill-name>/SKILL.md` via `skill_manage(action="create")`.
-4. Reusable workflow templates -> `flows/curated/<flow-name>/FLOW.md` via `flow_manage`.
-5. One-off task executions -> `flows/<task-slug>/`.
+2. Treat skills without `created_by: agent` and without `agent_editable: true` as read-only.
+3. Before create: `skill_manage(list)` — if a similar domain skill exists, `patch` it (never parallel skills).
+4. New learned procedures only when nothing similar exists -> `skill_manage(action="create")`.
+5. Reusable workflow templates -> `flows/curated/<flow-name>/FLOW.md` via `flow_manage`.
+6. One-off task executions -> `flows/<task-slug>/`.
+Follow `skills/skill-authoring-when` then `skill-authoring-how`
+(prefer update over create; do this before self-evolution invents a new skill).
 
 ### Engine defaults
 Fusion Flow may call external agent CLI engines. Prefer the psi engine; do not call this same
@@ -1003,7 +1064,12 @@ hand-copying the key.
 
 Never write API keys into this workspace, generated `.flow.ts` files, or committed `.env` files."""
 
-    async def build_system_prompt(self, model: str | None = None, tool_names: list[str] | None = None) -> str:
+    async def build_system_prompt(
+        self,
+        model: str | None = None,
+        tool_names: list[str] | None = None,
+        user_text: str = "",
+    ) -> str:
         # Capability root (skills/tools/SOUL) vs user open-folder (file IO guidance).
         ws = self._agent_dir
         user_ws = self._user_workspace
@@ -1078,6 +1144,9 @@ Never write API keys into this workspace, generated `.flow.ts` files, or committ
         if "todo" in tools:
             stable_parts += ["", TASK_PLANNING_SECTION]
 
+        if "skill_manage" in tools:
+            stable_parts += ["", SKILL_AUTHORING_SECTION]
+
         skills_section = build_skills_section(skills_xml)
         if skills_section:
             stable_parts += ["", skills_section]
@@ -1102,36 +1171,35 @@ Never write API keys into this workspace, generated `.flow.ts` files, or committ
 
         stable_parts += ["", SILENT_REPLIES_SECTION]
 
-        stable_prefix = "\n".join(stable_parts)
+        model_identity = build_model_identity_line(model)
+        if model_identity:
+            stable_parts += ["", model_identity]
 
-        # -- Dynamic suffix ------------------------------------------------
         # NOTE: the heartbeat instruction is intentionally NOT injected here.
         # The heartbeat schedule (schedules/heartbeat/TASK.md) already tells the
         # agent to reply HEARTBEAT_OK on its poll; injecting it into every turn's
         # system prompt caused HEARTBEAT_OK to leak into normal chat replies.
-        dynamic_parts: list[str] = []
-
-        model_identity = build_model_identity_line(model)
-        if model_identity:
-            dynamic_parts += [model_identity, ""]
-
         volatile = await _build_volatile(ws)
         if volatile:
-            dynamic_parts += [volatile, ""]
+            stable_parts += ["", volatile]
 
         dynamic_ctx = await _build_dynamic_context_files(ws)
         if dynamic_ctx:
-            dynamic_parts += [dynamic_ctx, ""]
+            stable_parts += ["", dynamic_ctx]
 
-        dynamic_parts += [_build_datetime_section(), ""]
-        dynamic_parts.append(_build_runtime_info(model))
+        return "\n".join(stable_parts)
 
-        while dynamic_parts and dynamic_parts[-1] == "":
-            dynamic_parts.pop()
+    async def build_turn_context(self, model: str | None = None) -> str:
+        """Assemble the volatile block for the turn about to run.
 
-        dynamic_suffix = "\n".join(dynamic_parts)
-
-        return stable_prefix + CACHE_BOUNDARY + dynamic_suffix
+        Everything here is re-rendered per turn and delivered at the tail of the
+        request (see ``turn_context_builder``), not inside the system prompt —
+        so the prompt and every earlier turn stay byte-identical. Keep it small
+        and keep it to things that genuinely change per turn: the clock, and the
+        runtime identity that can shift when the Session is re-attached.
+        """
+        parts = [_build_datetime_section(), "", _build_runtime_info(model)]
+        return "\n".join(parts)
 
     async def compact_history(
         self,
@@ -1251,7 +1319,67 @@ Never write API keys into this workspace, generated `.flow.ts` files, or committ
         )
 
 
-async def system_prompt_builder() -> str:
+def _resolve_workspace(workspace_raw: str = "") -> anyio.Path:
+    raw = workspace_raw or _runtime_workspace() or str(anyio.Path(__file__).parent.parent)
+    return anyio.Path(os.path.realpath(os.path.abspath(raw)))
+
+
+def _get_supervisor_manager(workspace: anyio.Path) -> Any:
+    key = os.path.realpath(os.path.abspath(str(workspace)))
+    manager = _SUPERVISOR_MANAGERS.get(key)
+    if manager is None:
+        supervisor_module = importlib.import_module("supervisor")
+        manager = supervisor_module.SupervisorManager(anyio.Path(key))
+        _SUPERVISOR_MANAGERS[key] = manager
+    return manager
+
+
+def _build_profile_policy(topic_profile: dict[str, Any]) -> str:
+    current_turn = int(topic_profile.get("turns", 0)) + 1
+    socratic = "3. **苏格拉底提问**: 本轮必须提问!" if current_turn % 3 == 0 else "3. 本轮不强制提问。"
+    return (
+        "## 强制监督规则\n\n"
+        "1. **确定性标记**: 事实性陈述使用 `[已确认]`、`[推断]` 或 `[需验证]`。\n"
+        "2. **反例注入**: 每个核心概念给出一个反例或边界场景。\n"
+        f"{socratic}\n4. **破圈引导**: 是否破圈由旁路监督按当前问题决定, 不绑定固定轮次。\n"
+        "5. **画像匹配**: 按教学指令控制深度、术语和决策信息。\n"
+    )
+
+
+async def system_before_turn(
+    user_message: dict[str, Any] | None,
+    *,
+    workspace_raw: str = "",
+) -> dict[str, Any]:
+    """Return validated background advice for an eligible learning turn."""
+    if not isinstance(user_message, dict):
+        return {}
+    content = user_message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return {}
+    if not any(
+        isinstance(user_message.get(name), str) and bool(user_message[name].strip())
+        for name in ("user_id", "profile_id", "session_id")
+    ):
+        return {}
+    supervisor_module = importlib.import_module("supervisor")
+    if not supervisor_module.is_learning_question(content):
+        return {}
+    try:
+        manager = _get_supervisor_manager(_resolve_workspace(workspace_raw))
+        before_turn = getattr(manager, "before_turn", None)
+        advice = await before_turn(user_message) if callable(before_turn) else await manager.supervise(user_message)
+    except Exception as exc:
+        logger.warning("Background supervisor unavailable: %r", exc, exc_info=True)
+        return {}
+    return advice if isinstance(advice, dict) else {}
+
+
+async def system_prompt_builder(
+    user_message: dict[str, Any] | None = None,
+    *,
+    workspace_raw: str = "",
+) -> str:
     """Module-level entry point used by the psi-agent session loader.
 
     The loader looks up an async ``system_prompt_builder`` attribute in this
@@ -1264,18 +1392,254 @@ async def system_prompt_builder() -> str:
     """
     agent_dir = anyio.Path(__file__).parent.parent
     user_workspace = agent_dir
-    raw = (_runtime_workspace() or "").strip()
+    raw = (workspace_raw or _runtime_workspace() or "").strip()
     if raw:
         user_workspace = anyio.Path(raw)
     await _activate_fusion_memory(agent_dir)
-    return await System(agent_dir, user_workspace=user_workspace).build_system_prompt()
+    content = user_message.get("content") if isinstance(user_message, dict) else ""
+    user_text = content if isinstance(content, str) else ""
+    profile_module = importlib.import_module("_user_profile")
+    identity = {
+        name: value
+        for name in ("profile_id", "user_id", "session_id")
+        if isinstance(user_message, dict) and isinstance((value := user_message.get(name)), str) and value
+    }
+    profile = await profile_module.get_profile(str(user_workspace), **identity)
+    topic_profile = None
+    if user_text.strip():
+        _topic_key, topic_profile = profile.get_topic(user_text)
+
+    profile_text = ""
+    policy_text = ""
+    if topic_profile:
+        dimensions = profile.effective_dimensions(topic_profile)
+        profile_text = (
+            "## 当前知识点学习画像 (每轮从持久化画像重新读取)\n"
+            f"- 当前知识点: {topic_profile['label']}\n"
+            f"- 累计轮次: {topic_profile['turns']}\n"
+            f"- 深度: {dimensions['depth']:.2f} (0=框架概览, 1=系统推导)\n"
+            f"- 目标: {dimensions['goal']:.2f} (0=兴趣, 1=决策)\n"
+            f"- 熟悉度: {dimensions['familiarity']:.2f} (0=新手, 1=专家)\n"
+            f"- 教学指令: {profile.teaching_hint(topic_profile)}\n"
+        )
+        policy_text = _build_profile_policy(topic_profile)
+
+    prompt = await System(agent_dir, user_workspace=user_workspace).build_system_prompt()
+    raw_advice = user_message.get("supervisor_advice") if isinstance(user_message, dict) else None
+    if isinstance(raw_advice, dict):
+        protocol = importlib.import_module("supervisor_protocol")
+        advice_text = protocol.render_advice_prompt(protocol.validate_advice(raw_advice))
+        if advice_text:
+            advice_text += "\n- 用户当前消息中的直接范围和深度要求优先; 若用户要求不展开, 则抑制破圈, 不得强制扩展。"
+    else:
+        advice_text = ""
+    injected = "\n".join(part for part in (profile_text, advice_text, policy_text) if part)
+    if not injected:
+        return prompt
+    boundary = "<!-- HAITUN_CACHE_BOUNDARY -->"
+    if boundary in prompt:
+        index = prompt.find(boundary) + len(boundary)
+        return prompt[:index] + "\n" + injected + "\n" + prompt[index:]
+    return prompt + "\n" + injected
 
 
-async def system_prompt_rebuild_checker() -> bool:
-    """Activate Memory on the first turn after restoring an existing Session."""
+RECENT_TURNS_KEPT_VERBATIM = 20
+"""How many trailing history messages ``compact_history`` keeps verbatim.
+
+Raised from 4 to 20: with 4, a compaction triggered near the token threshold
+left so little verbatim tail that the model lost the thread of the current
+task and re-compacted almost every other turn.  20 messages is roughly 10
+exchanges (~1% of the default 100K threshold for chat-only traffic).
+"""
+
+
+SUMMARY_MAX_CHARS = 8000
+"""Hard cap on the carried-forward summary.
+
+Chained summaries grow monotonically, and the result is merged into the system
+prompt — left unbounded it would shrink the per-turn budget it exists to protect
+and make compaction fire *more* often.  Truncation keeps the head, which is
+where the running summary states the task and decisions.
+"""
+
+
+def _cap_summary(text: str) -> str:
+    if len(text) <= SUMMARY_MAX_CHARS:
+        return text
+    return text[:SUMMARY_MAX_CHARS] + f"\n[... running summary truncated at {SUMMARY_MAX_CHARS} characters]"
+
+
+async def compact_history(history: list[dict[str, Any]], complete_fn) -> str:
+    """Summarize older conversation turns via LLM, keeping recent turns verbatim.
+
+    Returns the summary string with recent turns appended; the framework
+    merges the whole result into the system prompt.
+
+    Compactions chain: the summary produced by an earlier compaction is fed back
+    in so the model *updates* it instead of describing only the newest slice.
+    Without this the previous summary is silently dropped (its ``compacted`` row
+    is not a ``user``/``assistant`` message), so every compaction forgot one more
+    layer of the conversation.
+    """
+    if len(history) <= RECENT_TURNS_KEPT_VERBATIM + 2:
+        return ""
+
+    recent_count = RECENT_TURNS_KEPT_VERBATIM
+    older = history[:-recent_count]
+    recent = history[-recent_count:]
+
+    # Only the LAST compaction's summary is current; earlier ones are already
+    # folded into it and would re-introduce stale context if replayed.
+    previous_summary = ""
+    for msg in reversed(older):
+        if msg.get("role") == "compacted":
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                previous_summary = content
+            break
+
+    parts: list[str] = []
+    for msg in older:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip() and role in ("user", "assistant"):
+            parts.append(f"[{role}]: {content}")
+
+    recent_text = ""
+    recent_parts: list[str] = []
+    for msg in recent:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str) and content.strip() and role in ("user", "assistant"):
+            recent_parts.append(f"[{role}]: {content}")
+    if recent_parts:
+        recent_text = "\n[Recent turns]\n" + "\n".join(recent_parts)
+
+    if not parts:
+        # Nothing new to summarize, but an existing summary must still be carried
+        # forward — dropping it here would lose everything before this compaction.
+        if previous_summary:
+            return _cap_summary(previous_summary) + "\n" + recent_text
+        return recent_text
+
+    if previous_summary:
+        instruction = (
+            "You are maintaining a running summary of a long conversation. "
+            "Update the existing summary below so it also covers the new messages. "
+            "Preserve all key facts, decisions, task context, file paths, and "
+            "information either party explicitly mentioned — including everything "
+            "already captured in the existing summary. Do not drop earlier context, "
+            "and do not omit anything that could be needed later. "
+            f"Keep the result under roughly {SUMMARY_MAX_CHARS // 2} characters."
+        )
+        user_content = f"<existing-summary>\n{previous_summary}\n</existing-summary>\n\nNew messages:\n\n" + "\n".join(
+            parts
+        )
+    else:
+        instruction = (
+            "Summarize the following conversation concisely. "
+            "Preserve all key facts, decisions, task context, file paths, "
+            "and information the user or assistant explicitly mentioned. "
+            "Do not omit anything that could be needed later."
+        )
+        user_content = "Summarize:\n\n" + "\n".join(parts)
+
+    summary_prompt = [
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        summary = await complete_fn(summary_prompt)
+    except Exception:
+        # Fall back to the raw older text, still keeping any existing summary.
+        fallback = ("\n".join(parts)) if not previous_summary else previous_summary + "\n" + "\n".join(parts)
+        return _cap_summary(fallback) + "\n" + recent_text
+    return _cap_summary(summary) + "\n" + recent_text
+
+
+async def _context_files_changed(workspace_dir: anyio.Path) -> bool:
+    """Whether ``USER.md`` / dynamic context files differ from the last check.
+
+    First call per process primes the digest and returns False — the prompt was
+    just built from these same files, so there is nothing to rebuild for.
+    """
+    try:
+        digest = hashlib.sha256(
+            (await _build_volatile(workspace_dir) + "\0" + await _build_dynamic_context_files(workspace_dir)).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+    except Exception as exc:
+        logger.debug("Context file digest failed, skipping rebuild: %r", exc)
+        return False
+
+    key = str(workspace_dir)
+    previous = _CONTEXT_FILE_DIGESTS.get(key)
+    _CONTEXT_FILE_DIGESTS[key] = digest
+    return previous is not None and previous != digest
+
+
+async def turn_context_builder() -> str:
+    """Render the volatile block for the turn about to run.
+
+    ``system_prompt_builder`` runs once per Session, so every "now" it renders
+    freezes: a Session opened last Friday goes on reporting Friday's date, and
+    a ``Time zone`` label that was wrong at build time (a container whose TZ
+    had not taken effect yet reported ``UTC`` for Asia/Shanghai) stays wrong
+    for the whole life of that history. The agent then answers from that stale
+    line and, asked to reconcile it with reality, invents timezone arithmetic
+    to explain the gap.
+
+    The fix is not to re-render the prompt — that is the *front* of the
+    request, and rewriting it per turn invalidates the cache for the whole
+    conversation behind it. This block is delivered at the **tail** instead,
+    on the turn's own user message, so the prompt and every earlier turn stay
+    byte-identical.
+    """
+    agent_dir = anyio.Path(__file__).parent.parent
+    user_workspace = agent_dir
+    raw = (_runtime_workspace() or "").strip()
+    if raw:
+        user_workspace = anyio.Path(raw)
+    system = System(agent_dir, user_workspace=user_workspace)
+    return await system.build_turn_context()
+
+
+async def system_prompt_rebuild_checker(_user_message: dict[str, Any] | None = None) -> bool:
+    """Activate Memory and rebuild for the current topic-specific profile."""
     agent_dir = anyio.Path(__file__).parent.parent
     await _activate_fusion_memory(agent_dir)
-    return False
+    return True
+
+
+async def system_after_turn(
+    user_message: dict[str, Any],
+    assistant_message: dict[str, Any],
+    *,
+    workspace_raw: str = "",
+) -> None:
+    """Persist profile signals and warm the background supervisor."""
+    profile_module = importlib.import_module("_user_profile")
+    workspace = _resolve_workspace(workspace_raw)
+    identity = {
+        name: value
+        for name in ("profile_id", "user_id", "session_id")
+        if isinstance((value := user_message.get(name)), str) and value
+    }
+    profile = await profile_module.get_profile(str(workspace), **identity)
+    user_text = user_message.get("content")
+    assistant_text = assistant_message.get("content")
+    user_text = user_text if isinstance(user_text, str) else ""
+    assistant_text = assistant_text if isinstance(assistant_text, str) else ""
+    await profile.record_turn(user_text, assistant_text)
+
+    supervisor_module = importlib.import_module("supervisor")
+    if supervisor_module.is_learning_question(user_text):
+        try:
+            await _get_supervisor_manager(workspace).prime(user_message)
+        except Exception as exc:
+            logger.warning("Background supervisor warmup failed: %r", exc, exc_info=True)
 
 
 async def _activate_fusion_memory(workspace_dir: anyio.Path) -> None:

@@ -10,6 +10,17 @@ A consolidated psi-agent workspace whose agent is **Haitun (海豚)**. It combin
 
 See `AGENTS.md` for the full layout and conventions.
 
+The Haibao ChatBI MCP Adapter, public tools, and Skill are bundled in this workspace. They
+require an operator-provisioned private MCP server, which is not bundled or claimed to be
+deployed in production. See [`docs/haibao-integration.md`](docs/haibao-integration.md) for
+configuration, behavior, and production gates.
+
+`HAIBAO_MCP_TOKEN` is process-global: one Haitun process/workspace deployment is one configured
+Haibao principal and security boundary. It does not forward per-session identity. Never use one
+token/process to serve users who require distinct authorization; deploy a separate Haitun
+process, container, or workspace with a distinct token for each principal or distinct
+authorization cohort.
+
 ## Run
 
 Three terminals:
@@ -38,6 +49,9 @@ uv run psi-agent channel repl --session-socket /tmp/ch.sock
   For stateful sub-agent sessions, copy `bin/env.stateful.template` to
   `skills/fusion-flow/.env` and fill in the paths.
 - **Serper search** needs psi-agent installed with the `mcp` extra and `uvx` on PATH.
+- **Haibao ChatBI** needs the required operator-provisioned private MCP server and the three
+  deployment-managed variables documented in `docs/haibao-integration.md`. The bundled Adapter,
+  tools, and Skill do not provide the private service or database onboarding.
 - Never put API keys in this workspace or in generated `.flow.ts` / `.env` files.
 
 ## Fusion Memory
@@ -64,6 +78,11 @@ message after Haitun starts, the workspace automatically initiates
 `memory_add_batch`; the same token shares memory across Sessions, while tokens
 for different users remain isolated. Model-visible `<feishu_context>` never
 selects credentials.
+
+Generic work-arrangement records use the assignment tools backed by the same
+remote Fusion Memory connection.
+Feishu delivery for those records should use `assignment_send_card`, which
+wraps the existing interactive-card sender with stable work-assignment actions.
 
 Users absent from the map can chat normally but receive no bearer token,
 connector, passive writer, checkpoint, or durable memory. Duplicate token
@@ -106,11 +125,13 @@ uv run python examples/haitun-workspace/systems/system.py
 `.github/workflows/pyinstaller.yml` 的 `haitun-inno-setup` job 会自动构建 Windows 安装程序：
 
 1. PyInstaller 生成的 `psi-agent.exe` 被拷贝进本目录
-2. `haitun.iss`（Inno Setup 脚本）将整个 workspace 打包为安装程序
-3. 安装后通过 `haitun agent.vbs` 启动 `psi-agent gateway --tray --icon haitun.ico`
+2. Inno Setup（`.github/inno-setup/haitun.iss`）将整个 workspace 打包为安装程序
+3. 安装后通过 `haitun.exe`（由 `.github/inno-setup/haitun.c` 编译）启动 Gateway，**显式**传入：
+   - `--default-agent {app}`（安装目录即能力包：tools / skills / system）
+   - `--default-workspace {Desktop}/haitun交付`（用户文件区；运行时解析桌面路径）
 
-产物为 GitHub artifact `haitun-agent-installer`（`Haitun Agent Setup.exe`）。
+产物为 GitHub artifact `haitun-agent-installer-pyinstaller`（`HaiTun Agent Setup.exe`）。
 
-> `haitun agent.vbs` 启动前会读取本目录下的 `.env`（若存在），把其中的 `KEY=VALUE` 注入 `psi-agent.exe` 的运行环境（跳过空行 / `#` 注释，剥离值两端成对引号）。
+> `haitun.exe` 启动前会读取本目录下的 `.env`（若存在），把其中的 `KEY=VALUE` 注入 `psi-agent.exe` 的运行环境（跳过空行 / `#` 注释，剥离值两端成对引号）。
 
-> 安装包自带一份 MSYS2（位于 `{app}\msys64`，含 bash/git/curl/ssh、以及 ucrt64 的 nodejs/npm/uv，保留 pacman）。`haitun agent.vbs` 会把 `msys64\usr\bin` 与 `msys64\ucrt64\bin` 加到 `PATH` 最前，因此 `bash`、`node`、`npm`、`uv` 等在 Windows 上开箱即用，无需另装 Git Bash / Node。
+> 安装包自带一份 MSYS2（位于 `{app}\msys64`，含 bash/git/curl/ssh、以及 ucrt64 的 nodejs/npm/uv，保留 pacman）。`haitun.exe` 会把 `msys64\usr\bin` 与 `msys64\ucrt64\bin` 加到 `PATH` 最前，因此 `bash`、`node`、`npm`、`uv` 等在 Windows 上开箱即用，无需另装 Git Bash / Node。

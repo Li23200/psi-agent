@@ -181,7 +181,7 @@ OPENAPI_SPEC = {
         },
         "/feishu/route": {
             "post": {
-                "summary": "Route a Feishu open_id to its dedicated Session (spawn on first use)",
+                "summary": "Route a Feishu chat to its Session (per-chat for groups, per-user for DMs)",
                 "operationId": "feishuRoute",
                 "requestBody": {
                     "required": True,
@@ -200,7 +200,7 @@ OPENAPI_SPEC = {
         },
         "/feishu/routes": {
             "get": {
-                "summary": "List all Feishu open_id -> Session routes",
+                "summary": "List all Feishu chat -> Session routes",
                 "operationId": "listFeishuRoutes",
                 "responses": {
                     "200": {
@@ -217,6 +217,35 @@ OPENAPI_SPEC = {
                 },
             },
         },
+        "/oauth/callback": {
+            "get": {
+                "summary": "OAuth redirect landing point (relays the code, no manual copy)",
+                "operationId": "oauthCallback",
+                "parameters": [
+                    {"name": "state", "in": "query", "required": True, "schema": {"type": "string"}},
+                    {"name": "code", "in": "query", "schema": {"type": "string"}},
+                    {"name": "error", "in": "query", "schema": {"type": "string"}},
+                ],
+                "responses": {
+                    "200": {"description": "HTML success page; the code is held for the initiator"},
+                    "400": {"description": "HTML failure page (missing state, or provider error)"},
+                },
+            },
+        },
+        "/oauth/code": {
+            "get": {
+                "summary": "Take the relayed authorization code once, by state",
+                "operationId": "oauthTakeCode",
+                "parameters": [
+                    {"name": "state", "in": "query", "required": True, "schema": {"type": "string"}},
+                ],
+                "responses": {
+                    "200": {"description": "{state, code} — or {state, error}; consumed on read"},
+                    "400": {"$ref": "#/components/responses/Error"},
+                    "404": {"$ref": "#/components/responses/Error"},
+                },
+            },
+        },
         "/sessions/{session_id}/history": {
             "get": {
                 "summary": "Get session conversation history",
@@ -230,7 +259,13 @@ OPENAPI_SPEC = {
                     }
                 ],
                 "responses": {
-                    "200": {"description": "Array of {role, text} messages"},
+                    "200": {
+                        "description": (
+                            "Array of {role, text, kind?, sends?, reasoning?, tools?} messages; "
+                            "assistant may include JSONL ``reasoning`` (thinking) and "
+                            "``tools`` (structured tool_calls projection) for SPA process UI"
+                        )
+                    },
                     "404": {"$ref": "#/components/responses/Error"},
                 },
             },
@@ -249,6 +284,85 @@ OPENAPI_SPEC = {
                 ],
                 "responses": {
                     "200": {"description": ("Object with todos[] ({id, content, status}) and summary counts")},
+                    "404": {"$ref": "#/components/responses/Error"},
+                },
+            },
+        },
+        "/sessions/{session_id}/todo-segments": {
+            "get": {
+                "summary": "List todo sub-task segments (AppData *.segments.json, newest first)",
+                "operationId": "listTodoSegments",
+                "parameters": [
+                    {
+                        "name": "session_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": ("Array of {id, label, created_at, updated_at, closed_at, source, summary}")
+                    },
+                    "404": {"$ref": "#/components/responses/Error"},
+                },
+            },
+        },
+        "/sessions/{session_id}/todo-segments/{segment_id}": {
+            "get": {
+                "summary": "Get one todo segment including todos[]",
+                "operationId": "getTodoSegment",
+                "parameters": [
+                    {
+                        "name": "session_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "segment_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": ("Object with id, label, todos[], summary, closed_at, …")},
+                    "404": {"$ref": "#/components/responses/Error"},
+                },
+            },
+            "post": {
+                "summary": "Set todo segment label (P1 summary override)",
+                "operationId": "setTodoSegmentLabel",
+                "parameters": [
+                    {
+                        "name": "session_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "segment_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                ],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["label"],
+                                "properties": {"label": {"type": "string"}},
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Updated segment including todos[]"},
+                    "400": {"$ref": "#/components/responses/Error"},
                     "404": {"$ref": "#/components/responses/Error"},
                 },
             },
@@ -308,6 +422,67 @@ OPENAPI_SPEC = {
                 },
                 "responses": {
                     "200": {"description": "Generated title"},
+                    "400": {"$ref": "#/components/responses/Error"},
+                    "404": {"$ref": "#/components/responses/Error"},
+                    "500": {"$ref": "#/components/responses/Error"},
+                },
+            },
+        },
+        "/summaries": {
+            "get": {
+                "summary": "List all session task summaries",
+                "operationId": "listSummaries",
+                "responses": {
+                    "200": {"description": "Map of session IDs to task summaries"},
+                },
+            },
+            "post": {
+                "summary": "Set a session task summary",
+                "operationId": "setSummary",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["id", "summary"],
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "summary": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Summary set"},
+                    "400": {"$ref": "#/components/responses/Error"},
+                    "500": {"$ref": "#/components/responses/Error"},
+                },
+            },
+        },
+        "/summaries/generate": {
+            "post": {
+                "summary": "AI-generated task summary (1-2 sentences, not a title)",
+                "operationId": "generateSummary",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["id", "user_text", "assistant_text"],
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "user_text": {"type": "string"},
+                                    "assistant_text": {"type": "string"},
+                                },
+                            },
+                        },
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Generated summary"},
                     "400": {"$ref": "#/components/responses/Error"},
                     "404": {"$ref": "#/components/responses/Error"},
                     "500": {"$ref": "#/components/responses/Error"},
@@ -384,6 +559,34 @@ OPENAPI_SPEC = {
                 },
             },
         },
+        "/workspace/reveal": {
+            "post": {
+                "summary": "Reveal a path in the OS file manager",
+                "operationId": "revealWorkspacePath",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["path"],
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Absolute or resolvable filesystem path to select/open",
+                                    },
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "File manager launched ({path, ok})"},
+                    "400": {"$ref": "#/components/responses/Error"},
+                    "404": {"$ref": "#/components/responses/Error"},
+                },
+            },
+        },
     },
     "components": {
         "schemas": {
@@ -396,6 +599,17 @@ OPENAPI_SPEC = {
                     "model": {"type": "string"},
                     "api_key": {"type": "string"},
                     "base_url": {"type": "string"},
+                    "max_context_tokens": {
+                        "type": "integer",
+                        "default": -1,
+                        "description": (
+                            "Prompt token threshold that triggers history compaction. "
+                            "-1 = resolve from PSI_MAX_CONTEXT_TOKENS env var, else 100000. "
+                            "0 = disable compaction. Keep it well below the model's real "
+                            "context window so compaction runs before the upstream rejects "
+                            "the request."
+                        ),
+                    },
                 },
             },
             "AiInfo": {
@@ -405,6 +619,7 @@ OPENAPI_SPEC = {
                     "socket": {"type": "string"},
                     "provider": {"type": "string"},
                     "model": {"type": "string"},
+                    "max_context_tokens": {"type": "integer"},
                 },
             },
             "SessionCreateRequest": {
@@ -436,6 +651,33 @@ OPENAPI_SPEC = {
                     "workspace": {"type": "string"},
                     "agent": {"type": "string"},
                     "channel_socket": {"type": "string"},
+                    "active_schedules": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Names of the schedules under {workspace}/schedules this session "
+                            "actually fires; ['*'] means all of them. Activation is a "
+                            "(session x schedule) property, so sessions sharing a workspace can "
+                            "each fire a different subset"
+                        ),
+                    },
+                    "deactive_schedules": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Names excluded from active_schedules (blacklist, wins over the "
+                            "whitelist). A wildcard whitelist plus this blacklist is how a session "
+                            "claims 'everything except these', including TASK.md files created later"
+                        ),
+                    },
+                    "scheduler": {
+                        "type": "boolean",
+                        "description": (
+                            "Derived: true only for the per-workspace scheduler session that fires "
+                            "all of {workspace}/schedules (active_schedules == ['*']). Such sessions "
+                            "are hidden from GET /sessions, so this is always false in list responses"
+                        ),
+                    },
                 },
             },
             "GatewayDefaults": {
@@ -455,16 +697,32 @@ OPENAPI_SPEC = {
             },
             "FeishuRouteRequest": {
                 "type": "object",
-                "required": ["open_id"],
+                "description": (
+                    "Needs at least one routing key: open_id (DM) or chat_id with a group/topic chat_type."
+                ),
                 "properties": {
-                    "open_id": {"type": "string"},
+                    "open_id": {
+                        "type": "string",
+                        "description": "Sender's open_id. Required unless routing a group chat by chat_id.",
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Feishu chat id. With chat_type group/topic, the whole chat shares one Session.",
+                    },
+                    "chat_type": {
+                        "type": "string",
+                        "description": "p2p | group | topic. group/topic routes by chat_id, anything else by open_id.",
+                    },
                     "ai_id": {
                         "type": "string",
                         "description": "Optional, overrides Gateway --feishu-ai-id",
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Optional, defaults to <feishu_workspace_root>/<open_id>",
+                        "description": (
+                            "Optional, defaults to <feishu_workspace_root>/<open_id> "
+                            "(or /chat-<chat_id> for group chats)"
+                        ),
                     },
                 },
             },
@@ -472,14 +730,17 @@ OPENAPI_SPEC = {
                 "type": "object",
                 "properties": {
                     "open_id": {"type": "string"},
+                    "chat_id": {"type": "string"},
                     "session_id": {"type": "string"},
                     "channel_socket": {"type": "string"},
                 },
             },
             "FeishuRouteEntry": {
                 "type": "object",
+                "description": "One route. Group entries carry chat_id with an empty open_id; DMs the reverse.",
                 "properties": {
                     "open_id": {"type": "string"},
+                    "chat_id": {"type": "string"},
                     "session_id": {"type": "string"},
                 },
             },

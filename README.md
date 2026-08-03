@@ -115,7 +115,7 @@ uv run psi-agent gateway --listen http://127.0.0.1:8080   # 指定端口
 - **管理**：侧边栏切换会话、双击改名、删除确认
 - **自动标题**：首次对话后 AI 自动生成会话标题
 
-注意 `--listen` 参数需要 `http://` 前缀，裸 `IP:PORT` 会被误判为 Unix socket 路径。
+注意 `--listen` 参数需要 `http://` 前缀，裸 `IP:PORT` 不会被当成 TCP 地址：它匹配不上任何前缀，于是落到裸路径分支——在 POSIX 上被当成 Unix socket 路径，在 Windows 上则直接抛 `ValueError`（见下文「传输层抽象」）。
 
 Gateway 还支持系统托盘图标（`--tray --icon icon.png`）、自动打开浏览器（`--browser`）、原生 webview 窗口（`--webview`）和自定义 socket 路径前缀（`--socket-path psi`，控制 AI/Session Unix socket 的 `/tmp/{prefix}/ais/...` 和 `/tmp/{prefix}/channels/...` 路径）。
 
@@ -157,11 +157,15 @@ psi-agent
 
 | 地址格式 | 传输 |
 |----------|------|
-| `./ai.sock`（裸文件系统路径，相对/绝对路径均可） | Unix socket |
+| `./ai.sock`（裸文件系统路径，相对/绝对路径均可） | Unix socket（仅 POSIX） |
 | `http://127.0.0.1:8080` | TCP |
-| `\\.\pipe\name`（Windows） | Named Pipe |
+| `\\.\pipe\name`（Windows） | Named Pipe（仅 Windows） |
 
 AI 和 Session 组件无需关心通信介质——由 `_sockets.py` 统一处理。
+
+> **Windows 注意**：Windows 上没有 Unix socket（asyncio 无 `create_unix_connection`），因此裸文件系统路径在 Windows 会被**直接拒绝并抛出清晰的 `ValueError`**，而不是退化成 Unix socket 后在 aiohttp 深处报无上下文的 `NotImplementedError`。Windows 请用命名管道地址 `\\.\pipe\name`；经 POSIX shell（如 bash 单引号）传参时反斜杠须能存活——单反斜杠 `\.\pipe\...` 匹配不上命名管道前缀会被当成裸路径，同样触发该 `ValueError`。
+
+> **POSIX 注意**：反过来，命名管道只在 Windows 可用（需要 asyncio 的 `ProactorEventLoop`，该类在非 Windows 平台根本不存在），因此在 Linux/macOS 上传 `\\.\pipe\name` 也会被**直接拒绝并抛出清晰的 `ValueError`**，而不是让 aiohttp 内部的平台检查抛无上下文的 `AttributeError`。POSIX 上请用裸文件系统路径或 TCP 地址。
 
 组件间的协议错误有两种形式：
 
@@ -203,7 +207,7 @@ my-workspace/
 │   └── daily-report/
 │       └── TASK.md           # YAML 头 (name, cron) + Markdown body
 └── systems/
-    └── system.py             # async def system_prompt_builder() / system_prompt_rebuild_checker()
+    └── system.py             # async def system_prompt_builder() / system_prompt_rebuild_checker() / turn_context_builder()
 ```
 
 ### Tools
@@ -229,7 +233,7 @@ async def bash(command: str) -> str:
 
 ### System Prompt
 
-在 `systems/system.py` 中定义两个可选异步函数：
+在 `systems/system.py` 中定义三个可选异步函数：
 
 ```python
 async def system_prompt_builder() -> str:
@@ -239,11 +243,16 @@ async def system_prompt_builder() -> str:
 async def system_prompt_rebuild_checker() -> bool:
     """每次对话回合前调用。返回 True 则重建 system prompt。"""
     return False
+
+async def turn_context_builder() -> str:
+    """每次对话回合前调用。返回本回合的易变块（时间等），挂在本回合 user 消息尾部。"""
+    return render_volatile_sections()
 ```
 
 - `builder` 在首次对话时惰性调用
 - `checker` 每次回合前调用，可用于监控文件变更后自动刷新 prompt
-- 两个都是可选的，缺失时用合理默认值
+- `turn_context_builder` 每回合调用，产物**不进 system prompt**，而是随本回合的 user 消息一起送到**请求尾部**。之所以不写进 prompt：一是每回合重建要重扫整个 workspace；二是上游按前缀缓存，而 system prompt 是整个请求的最前面，每回合改它（哪怕只改尾部）就意味着无论怎么配缓存都不可能命中。挂在尾部则变动只落在这一个回合，前缀保持稳定——这是**开启缓存的前提**，框架本身并未开启（Anthropic 的 prompt caching 是 opt-in，需在请求顶层放 `cache_control`）。不定义它则整段 prompt 在会话内永不变——里面所有描述「现在」的内容都会冻结在首次构建那一刻
+- 三个都是可选的，缺失时用合理默认值。`turn_context_builder` 抛异常、返回非字符串或空串时一律当作没有这个块——丢一行时钟远好过丢掉整个回合
 
 ### 定时任务
 
@@ -260,6 +269,7 @@ cron: "0 12 * * *"
 - 每个 schedule 有独立 CancelScope，支持热重载
 - 每个 schedule 独立加载——IO 错误、YAML 解析问题、cron 验证失败只跳过该 schedule
 - Schedule 触发时自动获取 session lock，串行处理
+- **定时任务归 workspace，触发权归 (session × schedule)**：`schedules/` 始终从 workspace 加载（分离根部署时不从 `--agent` 包加载）；每个 Session 都读到全部条目，但**逐条**决定是否触发——`--active-schedules a,b` 只触发这两条，`--active-schedules '*'` 触发全部（含启动后新建的），`--deactive-schedules x` 从中排除（黑名单优先）。默认一条都不触发。「除某几条以外全归我」要写成 `'*'` + 黑名单：纯枚举白名单覆盖不到之后新建的 `TASK.md`。一条 schedule 必须恰好被一个 Session 激活，否则一条提醒会被在线会话数乘一遍（飞书为每个用户各开一个 Session）；Gateway 下由 `SchedulerManager` 为每个 workspace 维护唯一一个全量激活的调度 Session（挂哪个 AI 由 `psi-agent gateway --scheduler-ai-id` 决定，空则回落 `--feishu-ai-id`，两者都空就不起调度 Session）
 
 ### Skills
 
@@ -303,8 +313,8 @@ Gateway 暴露以下 REST 端点（详细信息见 [Gateway 层设计文档](src
 | GET | `/sessions` | 列出所有 Session |
 | POST | `/sessions/{session_id}/chat` | Web UI 对话（SSE 流式） |
 | GET | `/sessions/{session_id}/history` | 获取会话历史 |
-| POST | `/feishu/route` | 按飞书 open_id 幂等路由到其独立 Session（首次按需 spawn） |
-| GET | `/feishu/routes` | 列出飞书 open_id → Session 路由 |
+| POST | `/feishu/route` | 幂等路由飞书会话到 Session：群聊按 chat_id（整群共用），私聊按 open_id（一人一个），首次按需 spawn |
+| GET | `/feishu/routes` | 列出飞书会话 → Session 路由 |
 | GET | `/titles` | 获取所有会话标题 |
 | POST | `/titles` | 设置会话标题 |
 | POST | `/titles/generate` | AI 自动生成标题 |
@@ -368,7 +378,7 @@ uv run psi-agent channel feishu \
 - 处理状态表情：处理中显示 `Typing`，完成移除，失败显示 `CrossMark`
 - 支持文本、图片、文件、音频
 - 文档评论回复：`--respond-to-comments`（默认开）文档评论区 @机器人 时，用 agent 的回答回复该评论（需后台订阅 `drive.notice.comment_add_v1`）
-- 按用户独立会话：`--gateway-url http://127.0.0.1:8080` 接上 Gateway 后，每个飞书用户首次发消息时由 Gateway 按其 open_id 幂等 spawn 一个独立 Session（独立 workspace 子目录、独立历史），实现同一机器人对不同用户的隔离会话。所挂 AI 与 workspace 父目录由 Gateway 的 `--feishu-ai-id` / `--feishu-workspace-root` 决定。不设 `--gateway-url` 时全体共用 `--session-socket`（行为不变）。Gateway 不可达时自动回退共享 socket
+- 按会话独立 Session：`--gateway-url http://127.0.0.1:8080` 接上 Gateway 后，首次收到某会话消息时由 Gateway 幂等 spawn 一个独立 Session（独立 workspace 子目录、独立历史）。路由键分两类：**私聊按发送者 open_id**（一人一个，workspace `<root>/<open_id>`），**群聊按 chat_id**（`chat_type` 为 group/topic，整群共用一个 Session，workspace `<root>/chat-<chat_id>`）——于是机器人在群里对全体成员有连贯上下文，群与群、群与私聊之间互不串味。所挂 AI 与 workspace 父目录由 Gateway 的 `--feishu-ai-id` / `--feishu-workspace-root` 决定。不设 `--gateway-url` 时全体共用 `--session-socket`（行为不变）。Gateway 不可达时自动回退共享 socket
 
 ## 示例 Workspace
 

@@ -1,7 +1,8 @@
-import type { ChatMessage, DeliveryState, Task } from '../haitun-agent/model'
-import type { HistoryMessage, SessionInfo, SessionTodo } from './api'
+import type { ChatFile, ChatMessage, DeliveryState, Task } from '../haitun-agent/model'
+import type { HistoryMessage, HistoryToolCall, SessionInfo, SessionTodo } from './api'
 import { stripTransferMarkers } from './sendMarkers'
 import { applyTaskProgress } from './taskProgress'
+import { summarizeToolCall } from './turnProgress'
 
 const ACCENTS = ['#007bff', '#27a06b', '#d8a62a', '#ff6b57', '#4d8eff', '#7c5cfc']
 
@@ -30,6 +31,13 @@ export function basenameOf(path: string): string {
  * Project Gateway `/history` rows into workspace chat bubbles.
  * Server already whitelists by ``kind``; still strip transfer markers and drop empties
  * (parity with spa v1 useSession / historyReconcile).
+ * Assistant ``sends`` become file stubs (name + path, empty data) so chat chips
+ * survive refresh and can lazy-load via ``GET /workspace/file``.
+ *
+ * **刻意为之**：连续 `assistant` 行合并成一个 agent 气泡（文案 `\n\n` 拼接、files 去重合并）。
+ * Session 在每轮 `tool_calls` 都会把带正文的 assistant 落盘，todo 多步时 JSONL 常有
+ * 「Step N ✅ …」+ 短计划各占一行；流式 UI 经 `appendStreamingAgent` 累进同一气泡，
+ * 若不合并，刷新后会拆成多个气泡并各挂一套操作栏。
  */
 export function historyToChat(messages: HistoryMessage[]): ChatMessage[] {
   const out: ChatMessage[] = []
@@ -37,11 +45,96 @@ export function historyToChat(messages: HistoryMessage[]): ChatMessage[] {
     // Defense in depth: never surface silent schedule rows if a proxy leaks them.
     if (m.kind === 'schedule.silent') continue
     const text = stripTransferMarkers(typeof m.text === 'string' ? m.text : '')
+    const files = filesFromHistorySends(m)
+    // Empty text + no files → skip (SEND-only rows still feed historyToDeliverables).
+    if (!text.trim() && !files.length) continue
+    // Pure SEND bubble (no prose): still skip chat row; chest owns those files.
     if (!text.trim()) continue
+    const role = m.role === 'assistant' ? 'agent' : 'user'
+    const reasoning =
+      role === 'agent' && typeof m.reasoning === 'string' && m.reasoning.trim()
+        ? m.reasoning
+        : undefined
+    const tools = role === 'agent' ? toolSummariesFromHistory(m.tools) : []
+    const last = out[out.length - 1]
+    if (role === 'agent' && last?.role === 'agent') {
+      const mergedText = [last.text, text].filter((t) => t.trim()).join('\n\n')
+      const mergedFiles = mergeChatFiles(last.files, files)
+      const mergedReasoning = [last.reasoning, reasoning]
+        .filter((r): r is string => typeof r === 'string' && !!r.trim())
+        .join('\n')
+      const mergedTools = mergeToolLines(last.tools, tools)
+      out[out.length - 1] = {
+        ...last,
+        text: mergedText,
+        ...(mergedFiles.length ? { files: mergedFiles } : {}),
+        ...(mergedReasoning ? { reasoning: mergedReasoning } : {}),
+        ...(mergedTools.length ? { tools: mergedTools } : {}),
+      }
+      continue
+    }
     out.push({
-      role: m.role === 'assistant' ? 'agent' : 'user',
+      role,
       text,
+      ...(files.length ? { files } : {}),
+      ...(reasoning ? { reasoning } : {}),
+      ...(tools.length ? { tools } : {}),
     })
+  }
+  return out
+}
+
+function toolSummariesFromHistory(tools: HistoryToolCall[] | undefined): string[] {
+  if (!Array.isArray(tools) || !tools.length) return []
+  const out: string[] = []
+  for (const t of tools) {
+    if (!t || typeof t.name !== 'string' || !t.name.trim()) continue
+    const args = typeof t.arguments === 'string' ? t.arguments : '{}'
+    const line = summarizeToolCall(t.name, args)
+    if (out[out.length - 1] === line) continue
+    out.push(line)
+  }
+  return out
+}
+
+function mergeToolLines(
+  a: string[] | undefined,
+  b: string[] | undefined,
+): string[] {
+  const out: string[] = []
+  for (const line of [...(a ?? []), ...(b ?? [])]) {
+    if (!line.trim()) continue
+    if (out[out.length - 1] === line) continue
+    out.push(line)
+  }
+  return out
+}
+
+/** Merge history file stubs by basename (later path wins). */
+function mergeChatFiles(
+  a: ChatFile[] | undefined,
+  b: ChatFile[] | undefined,
+): ChatFile[] {
+  const map = new Map<string, ChatFile>()
+  for (const f of [...(a ?? []), ...(b ?? [])]) {
+    if (!f?.name) continue
+    map.set(f.name, f)
+  }
+  return [...map.values()]
+}
+
+/** Build chat file stubs from history ``sends`` (no base64 until preview load). */
+export function filesFromHistorySends(m: HistoryMessage): ChatFile[] {
+  if (m.role !== 'assistant' || !Array.isArray(m.sends)) return []
+  const out: ChatFile[] = []
+  const seen = new Set<string>()
+  for (const raw of m.sends) {
+    if (typeof raw !== 'string' || !raw.trim()) continue
+    const path = raw.trim()
+    const name = basenameOf(path)
+    if (seen.has(name)) continue
+    seen.add(name)
+    out.push({ name, data: '', path })
   }
   return out
 }
@@ -97,7 +190,7 @@ export function sessionToTask(
     summary:
       opts?.summary
       ?? '任务已接入 Gateway Session。在下方对话中继续推进，Agent 会真实执行工具并回复。',
-    progress: opts?.progress ?? 8,
+    progress: opts?.progress ?? 0,
     status,
     statusLabel: statusLabelFor(status),
     eta: status === 'completed' ? '已完成' : '进行中',

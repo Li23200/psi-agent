@@ -115,7 +115,7 @@ Open the printed address to see a Material Design 3 Web Console. From the UI you
 - **Manage**: Sidebar session switching, double-click rename, delete with confirmation
 - **Automatic titles**: AI generates session titles after first conversation
 
-The `--listen` value must include the `http://` prefix; bare `IP:PORT` is interpreted as a Unix socket path.
+The `--listen` value must include the `http://` prefix. A bare `IP:PORT` matches no prefix and falls through to the bare-path branch: on POSIX it is interpreted as a Unix socket path, while on Windows it raises `ValueError` outright (see "Transport Abstraction" below).
 
 Gateway also supports system tray icon (`--tray --icon icon.png`), auto browser open (`--browser`), native webview window (`--webview`), and custom socket path prefix (`--socket-path psi`, controlling the `/tmp/{prefix}/ais/...` and `/tmp/{prefix}/channels/...` layout for AI/Session Unix sockets).
 
@@ -157,11 +157,15 @@ All components auto-detect transport type via address prefix:
 
 | Address Format | Transport |
 |----------------|-----------|
-| `./ai.sock` (bare filesystem path, relative or absolute) | Unix socket |
+| `./ai.sock` (bare filesystem path, relative or absolute) | Unix socket (POSIX only) |
 | `http://127.0.0.1:8080` | TCP |
-| `\\.\pipe\name` (Windows) | Named Pipe |
+| `\\.\pipe\name` (Windows) | Named Pipe (Windows only) |
 
 AI and Session components are transport-agnostic — handled uniformly by `_sockets.py`.
+
+> **Windows note**: Windows has no Unix sockets (asyncio lacks `create_unix_connection`), so a bare filesystem path is **rejected outright with a clear `ValueError`** rather than falling through to a Unix socket and crashing with a context-free `NotImplementedError` deep inside aiohttp. On Windows use a named-pipe address `\\.\pipe\name`; when passing it through a POSIX shell (e.g. bash single-quotes) the backslashes must survive — a single-backslash `\.\pipe\...` fails the named-pipe prefix check, is treated as a bare path, and triggers the same `ValueError`.
+
+> **POSIX note**: Conversely, named pipes only work on Windows (they need asyncio's `ProactorEventLoop`, a class that does not exist off Windows), so a `\\.\pipe\name` address on Linux/macOS is likewise **rejected outright with a clear `ValueError`** instead of letting aiohttp's internal platform check fail with a context-free `AttributeError`. On POSIX use a bare filesystem path or a TCP address.
 
 Protocol errors between components take two forms:
 
@@ -203,7 +207,7 @@ my-workspace/
 │   └── daily-report/
 │       └── TASK.md           # YAML header (name, cron) + Markdown body
 └── systems/
-    └── system.py             # async def system_prompt_builder() / system_prompt_rebuild_checker()
+    └── system.py             # async def system_prompt_builder() / system_prompt_rebuild_checker() / turn_context_builder()
 ```
 
 ### Tools
@@ -229,7 +233,7 @@ async def bash(command: str) -> str:
 
 ### System Prompt
 
-Define two optional async functions in `systems/system.py`:
+Define three optional async functions in `systems/system.py`:
 
 ```python
 async def system_prompt_builder() -> str:
@@ -239,11 +243,28 @@ async def system_prompt_builder() -> str:
 async def system_prompt_rebuild_checker() -> bool:
     """Called before every agent turn. Return True to rebuild the system prompt."""
     return False
+
+async def turn_context_builder() -> str:
+    """Called before every agent turn. Returns this turn's volatile block (the
+    clock, runtime info), carried on this turn's own user message."""
+    return render_volatile_sections()
 ```
 
 - `builder` is lazily called on the first conversation turn
 - `checker` runs before each turn, useful for auto-refreshing prompts when files change
-- Both are optional; sensible defaults are used when absent
+- `turn_context_builder` runs every turn, and its output does **not** go into the system
+  prompt — it rides on this turn's user message, at the **tail** of the request. Why not in
+  the prompt: rebuilding it per turn means rescanning the whole workspace per turn, and
+  upstream caches by prefix while the system prompt is the *front* of the request — so a
+  prompt that changes every turn can never be cached however the cache is configured. At
+  the tail, the change is confined to that one turn and the prefix stays stable, which is
+  what makes enabling caching possible (the framework does not enable it: Anthropic's
+  prompt caching is opt-in and needs a top-level `cache_control`). Without it the whole
+  prompt never changes within a Session, freezing everything in it that describes *now* at
+  first-build time
+- All three are optional; sensible defaults are used when absent. A `turn_context_builder`
+  that raises, returns a non-string, or returns an empty string is treated as "no block" —
+  losing a clock line is a far smaller problem than losing the turn
 
 ### Scheduled Tasks
 
@@ -260,6 +281,7 @@ Generate a daily progress report.
 - Each schedule has an independent CancelScope and supports hot-reload
 - Each schedule is loaded independently — IO errors, YAML parsing issues, or cron validation failures only skip that schedule
 - Schedule triggers acquire the session lock and execute serially
+- **Schedules belong to the workspace; the right to fire belongs to a (session × schedule) pair**: `schedules/` is always loaded from the workspace (never from the `--agent` package under a split-root setup), and every Session sees all entries — but activation is decided per entry. `--active-schedules a,b` fires just those two; `--active-schedules '*'` fires all of them, including entries created after startup; `--deactive-schedules x` carves entries out (the blacklist wins). The default activates none. Write `'*'` plus a blacklist for "everything except these" — an enumerated whitelist cannot cover `TASK.md` files created later. Each schedule must be activated by exactly one Session, otherwise a single reminder would fire once per online session (Feishu spawns one Session per user). Under Gateway, `SchedulerManager` maintains exactly one fully activated scheduler session per workspace (which AI it mounts is set by `psi-agent gateway --scheduler-ai-id`, falling back to `--feishu-ai-id`; with both empty no scheduler session is started)
 
 ### Skills
 
@@ -303,8 +325,8 @@ Gateway exposes the following REST endpoints (see [Gateway layer docs](src/psi_a
 | GET | `/sessions` | List all Sessions |
 | POST | `/sessions/{session_id}/chat` | Web UI chat (SSE stream) |
 | GET | `/sessions/{session_id}/history` | Get conversation history |
-| POST | `/feishu/route` | Idempotently route a Feishu open_id to its dedicated Session (spawn on first use) |
-| GET | `/feishu/routes` | List Feishu open_id → Session routes |
+| POST | `/feishu/route` | Idempotently route a Feishu chat to a Session: group chats by chat_id (whole chat shares one), DMs by open_id (one per user); spawn on first use |
+| GET | `/feishu/routes` | List Feishu chat → Session routes |
 | GET | `/titles` | Get all session titles |
 | POST | `/titles` | Set session title |
 | POST | `/titles/generate` | AI auto-generate title |
@@ -368,7 +390,7 @@ uv run psi-agent channel feishu \
 - Processing status emoji: `Typing` while processing, removed on completion, `CrossMark` on failure
 - Supports text, images, files, and audio
 - Doc comment replies: `--respond-to-comments` (on by default) — when the bot is @-mentioned in a document comment, reply to that comment with the agent's answer (requires subscribing to `drive.notice.comment_add_v1` in the Feishu console)
-- Per-user isolated sessions: with `--gateway-url http://127.0.0.1:8080`, on each Feishu user's first message the Gateway idempotently spawns a dedicated Session keyed by their open_id (isolated workspace subdir and history), giving one bot per-user isolated conversations. The mounted AI and workspace parent dir are set via the Gateway's `--feishu-ai-id` / `--feishu-workspace-root`. Without `--gateway-url` all users share `--session-socket` (unchanged behavior). Falls back to the shared socket if the Gateway is unreachable
+- Per-chat isolated sessions: with `--gateway-url http://127.0.0.1:8080`, on the first message from a given chat the Gateway idempotently spawns a dedicated Session (isolated workspace subdir and history). Two routing keys: **DMs by sender open_id** (one Session per user, workspace `<root>/<open_id>`) and **group chats by chat_id** (`chat_type` group/topic — the whole chat shares one Session, workspace `<root>/chat-<chat_id>`), so the bot keeps coherent context across everyone in a group while group-to-group and group-to-DM contexts stay separate. The mounted AI and workspace parent dir are set via the Gateway's `--feishu-ai-id` / `--feishu-workspace-root`. Without `--gateway-url` all chats share `--session-socket` (unchanged behavior). Falls back to the shared socket if the Gateway is unreachable
 
 ## Example Workspaces
 

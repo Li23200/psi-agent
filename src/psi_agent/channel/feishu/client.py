@@ -8,7 +8,8 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, aclosing
 from datetime import date
-from typing import Any
+from pathlib import Path
+from typing import Any, Protocol
 
 import aiohttp
 import anyio
@@ -26,10 +27,24 @@ from lark_channel.event.custom import CustomizedEventProcessor
 from loguru import logger
 
 from psi_agent.channel._core import ChannelCore
-from psi_agent.channel._types import FileChunk, InputChunk, TextChunk
+from psi_agent.channel._types import FileChunk, InputChunk, ReasoningChunk, TextChunk
+from psi_agent.channel.feishu._agent_events import register_feishu_agent_events
+
+from ._card_action import handle_card_action
 
 _EMOJI_PROCESSING = "Typing"
 _EMOJI_FAILED = "CrossMark"
+_SILENT_REPLY_TOKEN = "NO_REPLY"
+
+
+class ResolveCore(Protocol):
+    """把一次飞书会话解析成对应 Session 的 ``ChannelCore``。
+
+    ``chat_id``/``chat_type`` 是可选的会话事实: 群消息带上后由 Gateway 按 ``chat_id`` 路由
+    (整群共用一个 session); 缺省 (文档评论、审批推送等无 IM 会话的场景) 即按 ``open_id`` 路由。
+    """
+
+    def __call__(self, open_id: str | None, *, chat_id: str = "", chat_type: str = "") -> Awaitable[ChannelCore]: ...
 
 
 def _allowed(sender_id: str | None, allowed_ids: list[str] | None) -> bool:
@@ -70,40 +85,58 @@ class _CoreRegistry:
 _GATEWAY_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 
-class _GatewayRouteProvider:
-    """给 open_id → 幂等返回其 Gateway session 的 ``channel_socket``; 面向动态任意用户。
+_GROUP_CHAT_TYPES = frozenset({"group", "topic"})
 
-    路由决策权归 **Gateway** —— 首次见到某 open_id 时经 Gateway REST ``POST /feishu/route``
+
+class _GatewayRouteProvider:
+    """给一次会话 → 幂等返回其 Gateway session 的 ``channel_socket``; 面向动态任意用户/群。
+
+    路由决策权归 **Gateway** —— 首次见到某会话时经 Gateway REST ``POST /feishu/route``
     (``FeishuManager`` 按需 spawn 独立 Session, ``ai_id``/``workspace`` 由 Gateway 侧配置决定),
-    拿回 ``channel_socket`` 缓存复用; channel 只连接不 spawn、退出时也不删。并发安全: 快路径
-    dict 读 + 慢路径 ``anyio.Lock`` double-checked, 同一 open_id 的并发消息串行到一次路由。
-    路由失败向上抛(由调用方回退共享 socket), 且**不写缓存**, 下条消息会重试 Gateway。
+    拿回 ``channel_socket`` 缓存复用; channel 只连接不 spawn、退出时也不删。
+
+    本地缓存键与 Gateway 的路由键保持一致: 群聊 (``chat_type`` 为 group/topic 且 ``chat_id``
+    非空) 按 ``chat_id`` 缓存, 于是同群不同发送者复用同一 socket, 也只打 Gateway 一次; 其余按
+    ``open_id`` 缓存。并发安全: 快路径 dict 读 + 慢路径 ``anyio.Lock`` double-checked, 同一键的
+    并发消息串行到一次路由。路由失败向上抛(由调用方回退共享 socket), 且**不写缓存**, 下条消息
+    会重试 Gateway。
     """
 
     def __init__(self, base_url: str, http: aiohttp.ClientSession) -> None:
         self._base = base_url.rstrip("/")
         self._http = http
-        self._sockets: dict[str, str] = {}  # open_id -> channel_socket
+        self._sockets: dict[str, str] = {}  # 路由键 -> channel_socket
         self._lock = anyio.Lock()
 
-    async def ensure(self, open_id: str) -> str:
-        hit = self._sockets.get(open_id)  # 快路径
+    @staticmethod
+    def _cache_key(open_id: str, chat_id: str, chat_type: str) -> str:
+        """与 Gateway ``FeishuManager`` 同款判定: 群聊按 chat_id, 其余按 open_id。
+
+        加 ``chat:`` 前缀隔离两个命名空间, 免得 chat_id 与 open_id 相撞。
+        """
+        if chat_type in _GROUP_CHAT_TYPES and chat_id:
+            return f"chat:{chat_id}"
+        return open_id
+
+    async def ensure(self, open_id: str, *, chat_id: str = "", chat_type: str = "") -> str:
+        key = self._cache_key(open_id, chat_id, chat_type)
+        hit = self._sockets.get(key)  # 快路径
         if hit is not None:
             return hit
         async with self._lock:  # 慢路径: double-checked
-            hit = self._sockets.get(open_id)
+            hit = self._sockets.get(key)
             if hit is not None:
                 return hit
-            socket = await self._route(open_id)
-            self._sockets[open_id] = socket
-            logger.debug(f"routed open_id={open_id!r} -> socket={socket!r}")
+            socket = await self._route(open_id, chat_id, chat_type)
+            self._sockets[key] = socket
+            logger.debug(f"routed {key!r} -> socket={socket!r}")
             return socket
 
-    async def _route(self, open_id: str) -> str:
-        """POST /feishu/route 拿回该 open_id 的 channel_socket (Gateway 幂等 spawn/复用)。"""
+    async def _route(self, open_id: str, chat_id: str, chat_type: str) -> str:
+        """POST /feishu/route 拿回该会话的 channel_socket (Gateway 幂等 spawn/复用)。"""
         async with self._http.post(
             f"{self._base}/feishu/route",
-            json={"open_id": open_id},
+            json={"open_id": open_id, "chat_id": chat_id, "chat_type": chat_type},
             timeout=_GATEWAY_TIMEOUT,
         ) as resp:
             if resp.status == 201:
@@ -267,9 +300,69 @@ async def _build_chunks(channel: Any, ctx: Any) -> list[InputChunk]:
     return chunks
 
 
+async def _stream_reply(
+    channel: Any,
+    core: ChannelCore,
+    chat_id: str,
+    chunks: list[InputChunk],
+    *,
+    reply_to: str | None,
+    suppress_silent_reply: bool = False,
+) -> None:
+    """Stream agent text and files into one Feishu chat."""
+
+    async def _produce(stream: Any) -> None:
+        silent_candidate = ""
+        checking_silent_reply = suppress_silent_reply
+
+        async def flush_silent_candidate() -> None:
+            nonlocal silent_candidate
+            if not silent_candidate:
+                return
+            candidate = silent_candidate
+            silent_candidate = ""
+            normalized = candidate.strip()
+            if not normalized:
+                logger.debug("suppressed whitespace-only Feishu card action reply")
+            elif normalized == _SILENT_REPLY_TOKEN:
+                logger.debug("suppressed standalone NO_REPLY from Feishu card action")
+            else:
+                await stream.append(candidate)
+                logger.debug(f"stream.append ({len(candidate)} chars)")
+
+        try:
+            async with aclosing(core.post(chunks)) as gen:
+                async for chunk in gen:
+                    if isinstance(chunk, TextChunk):
+                        if checking_silent_reply:
+                            silent_candidate += chunk.text
+                            normalized = silent_candidate.strip()
+                            if not normalized or _SILENT_REPLY_TOKEN.startswith(normalized):
+                                continue
+                            await flush_silent_candidate()
+                            checking_silent_reply = False
+                        else:
+                            await stream.append(chunk.text)
+                            logger.debug(f"stream.append ({len(chunk.text)} chars)")
+                    elif isinstance(chunk, ReasoningChunk):
+                        if suppress_silent_reply and chunk.kind == "tool_result":
+                            await flush_silent_candidate()
+                            checking_silent_reply = True
+                    elif isinstance(chunk, FileChunk):
+                        logger.debug(f"received FileChunk ({chunk.path})")
+                        await _send_file(channel, chat_id, chunk.path)
+        except Exception:
+            await flush_silent_candidate()
+            raise
+        await flush_silent_candidate()
+
+    options = {"reply_to": reply_to} if reply_to else {}
+    await channel.stream(chat_id, {"markdown": _produce}, options)
+
+
 async def _handle_and_stream(
     channel: Any,
-    resolve_core: Callable[[str | None], Awaitable[ChannelCore]],
+    resolve_core: ResolveCore,
     allowed_ids: list[str] | None,
     ctx: Any,
 ) -> None:
@@ -278,9 +371,11 @@ async def _handle_and_stream(
         return
 
     # 白名单通过后才解析 core, 被拦用户不建连接 (防非白名单 open_id 刷出大量 ClientSession)。
-    # 按发送者 open_id 路由到其 per-user session。
-    core = await resolve_core(ctx.sender_id)
-    logger.debug(f"sender={ctx.sender_id} chat={ctx.chat_id} socket={core.session_socket}")
+    # 群聊按 chat_id 路由到该群的 session (整群共用), 私聊按发送者 open_id 路由到其个人
+    # session —— 判定归 Gateway, 这里只如实上报会话事实。
+    chat_type = getattr(ctx, "chat_type", "") or ""
+    core = await resolve_core(ctx.sender_id, chat_id=ctx.chat_id, chat_type=chat_type)
+    logger.debug(f"sender={ctx.sender_id} chat={ctx.chat_id} type={chat_type} socket={core.session_socket}")
 
     reaction_id = await _add_reaction(channel, ctx.message_id, _EMOJI_PROCESSING)
     failed = False
@@ -301,22 +396,8 @@ async def _handle_and_stream(
 
             logger.debug(f"posting {len(chunks)} chunk(s) to ChannelCore")
 
-            async def _produce(stream: Any) -> None:
-                async with aclosing(core.post(chunks)) as gen:
-                    async for chunk in gen:
-                        if isinstance(chunk, TextChunk):
-                            await stream.append(chunk.text)
-                            logger.debug(f"stream.append ({len(chunk.text)} chars)")
-                        elif isinstance(chunk, FileChunk):
-                            logger.debug(f"received FileChunk ({chunk.path})")
-                            await _send_file(channel, ctx.chat_id, chunk.path)
-
             try:
-                await channel.stream(
-                    ctx.chat_id,
-                    {"markdown": _produce},
-                    {"reply_to": ctx.message_id},
-                )
+                await _stream_reply(channel, core, ctx.chat_id, chunks, reply_to=ctx.message_id)
                 logger.debug("stream completed")
             except Exception as e:
                 logger.error(f"Message handling error — {e!r}")
@@ -350,7 +431,7 @@ async def _collect_reply(core: ChannelCore, chunks: list[InputChunk]) -> str:
 
 async def _handle_comment(
     channel: Any,
-    resolve_core: Callable[[str | None], Awaitable[ChannelCore]],
+    resolve_core: ResolveCore,
     allowed_ids: list[str] | None,
     event: Any,
 ) -> None:
@@ -453,7 +534,7 @@ _APPROVAL_STATUS_LABELS = {
 
 
 class _SeenEvents:
-    """有界去重集 — 飞书会重推同一事件, 用 (instance_code, status) 键去重。
+    """有界去重集 — 卡片按 message_id、审批按 (instance_code, status) 去重。
 
     ``OrderedDict`` 当 FIFO: 超过 ``maxlen`` 淘汰最旧键, 内存有界。非线程安全,
     只在 portal 的事件循环里单线程访问, 无需加锁。"""
@@ -540,7 +621,7 @@ _APPROVAL_INSTRUCTION = (
 
 async def _handle_approval_event(
     channel: Any,
-    resolve_core: Callable[[str | None], Awaitable[ChannelCore]],
+    resolve_core: ResolveCore,
     allowed_ids: list[str] | None,
     seen: _SeenEvents,
     event: Any,
@@ -683,6 +764,8 @@ async def run_feishu(
     respond_to_mention_all: bool = False,
     respond_to_comments: bool = True,
     gateway_url: str | None = None,
+    appdata: str = "",
+    agent_root: str = "",
 ) -> None:
     policy = PolicyConfig(
         require_mention=require_mention,
@@ -705,14 +788,15 @@ async def run_feishu(
             http = await stack.enter_async_context(aiohttp.ClientSession())
             provider = _GatewayRouteProvider(gateway_url, http)
 
-        async def resolve_core(open_id: str | None) -> ChannelCore:
-            socket = session_socket  # 默认兜底 (open_id 为 None、无 gateway、或路由失败都走这)
-            if provider is not None and open_id:
+        async def resolve_core(open_id: str | None, *, chat_id: str = "", chat_type: str = "") -> ChannelCore:
+            socket = session_socket  # 默认兜底 (无路由键、无 gateway、或路由失败都走这)
+            is_group = chat_type in _GROUP_CHAT_TYPES and bool(chat_id)
+            if provider is not None and (open_id or is_group):
                 try:
-                    socket = await provider.ensure(open_id)
+                    socket = await provider.ensure(open_id or "", chat_id=chat_id, chat_type=chat_type)
                 except Exception as e:  # gateway 不可达 / 路由失败 → 回退共享 socket
                     logger.warning(
-                        f"Gateway route failed for open_id={open_id!r}, "
+                        f"Gateway route failed for open_id={open_id!r} chat_id={chat_id!r}, "
                         f"falling back to shared socket {session_socket!r} — {e!r}"
                     )
                     socket = session_socket
@@ -721,9 +805,22 @@ async def run_feishu(
         async def _on_message(ctx: Any) -> None:
             portal.start_task_soon(_handle_and_stream, channel, resolve_core, allowed_user_ids, ctx)
 
+        async def _on_card_action(event: Any) -> None:
+            portal.start_task_soon(
+                handle_card_action,
+                channel,
+                resolve_core,
+                allowed_user_ids,
+                card_action_seen.add_if_new,
+                _stream_reply,
+                event,
+                appdata,
+            )
+
         async def _on_comment(event: Any) -> None:
             portal.start_task_soon(_handle_comment, channel, resolve_core, allowed_user_ids, event)
 
+        card_action_seen = _SeenEvents(maxlen=10_000)
         approval_seen = _SeenEvents()
 
         def _on_approval(event: Any) -> None:
@@ -736,6 +833,7 @@ async def run_feishu(
                 logger.warning(f"approval event schedule failed — {e!r}")
 
         channel.on("message", _on_message)
+        channel.on("cardAction", _on_card_action)
         channel.on("reject", _log_reject)
         if respond_to_comments:
             channel.on("comment", _on_comment)
@@ -747,7 +845,27 @@ async def run_feishu(
             # dispatcher, so an earlier registration would be discarded.
             _register_approval_processor(channel, _on_approval)
             await _ensure_bot_identity(channel)
-            await anyio.sleep_forever()
+            # Agent-package channel_events/feishu → unified POST /events
+            if agent_root.strip():
+                root = await anyio.Path(agent_root).expanduser()
+            else:
+                root = await anyio.Path.cwd()
+            root_resolved = Path(await root.resolve())
+            # TaskGroup owns synthetic producers; cancel with Channel shutdown.
+            async with anyio.create_task_group() as events_tg:
+                stats = await register_feishu_agent_events(
+                    channel=channel,
+                    agent_root=root_resolved,
+                    resolve_core=resolve_core,
+                    portal_start=portal.start_task_soon,
+                    task_group=events_tg,
+                )
+                logger.info(
+                    f"Feishu agent channel_events root={root_resolved} "
+                    f"platform_processors={stats.platform_processors} "
+                    f"synthetic_producers={stats.synthetic_producers}"
+                )
+                await anyio.sleep_forever()
         finally:
             logger.info("Shutting down Feishu bot")
             with anyio.CancelScope(shield=True):

@@ -15,7 +15,7 @@ from psi_agent._appdata import (
     resolve_appdata_root,
 )
 
-_EMPTY_KEYS = ("ais", "routers", "sessions", "titles")
+_EMPTY_KEYS = ("ais", "routers", "sessions", "titles", "summaries")
 
 
 def _empty_snapshot() -> dict[str, list[dict[str, Any]]]:
@@ -78,16 +78,19 @@ class GatewayState:
             "routers": data.get("routers", []),
             "sessions": data.get("sessions", []),
             "titles": data.get("titles", []),
+            "summaries": data.get("summaries", []),
         }
 
     async def save(
         self,
-        ais: list[dict[str, str]],
+        ais: list[dict[str, Any]],
         sessions: list[dict[str, str]],
         titles: list[dict[str, str]],
         routers: list[dict[str, Any]] | None = None,
+        summaries: list[dict[str, str]] | None = None,
     ) -> None:
         routers = routers or []
+        summaries = summaries or []
         data = {
             "ais": [
                 {
@@ -96,6 +99,10 @@ class GatewayState:
                     "model": a["model"],
                     "api_key": a["api_key"],
                     "base_url": a["base_url"],
+                    # Compaction threshold. Whitelisted explicitly like the rest:
+                    # omitting it here would silently reset a configured threshold
+                    # to the default on every Gateway restart.
+                    "max_context_tokens": a.get("max_context_tokens", -1),
                 }
                 for a in ais
             ],
@@ -110,6 +117,7 @@ class GatewayState:
                 for s in sessions
             ],
             "titles": [{"id": t["id"], "title": t["title"]} for t in titles],
+            "summaries": [{"id": s["id"], "summary": s["summary"]} for s in summaries],
         }
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         try:

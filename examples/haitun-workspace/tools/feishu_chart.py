@@ -5,10 +5,12 @@ only way to get a genuine data chart into a Feishu document is to render an imag
 append it as an image block (block_type 27). These tools do exactly that: each one
 takes tidy data, renders a house-styled PNG, and places it in the doc with a caption.
 
-One tool per chart type, because picking the right chart is the hard part and a tool
-name that says ``pie`` / ``line`` / ``pareto`` makes the choice explicit — as do the
-"use this when" lines in each docstring. Pair with the ``feishu-charts`` skill, which
-carries the full chart-selection rules.
+One tool with a ``chart_type`` argument rather than one tool per type: the 21 types
+share only six arguments, so separate schemas cost ~13k tokens of context in every
+turn while the thing that actually matters — *which* chart answers the question — is
+a judgement the ``feishu-charts`` skill already carries. The renderers below keep
+their individual signatures and their "use this when" guidance; ``_CHART_SPECS`` maps
+each ``chart_type`` to one of them.
 
 Part-of-whole:  ``pie`` ``donut`` ``funnel``
 Trend:          ``line`` ``area`` ``stacked_area``
@@ -16,10 +18,16 @@ Comparison:     ``column`` ``bar`` ``grouped_column`` ``stacked_column`` ``water
 Distribution:   ``histogram`` ``box`` ``scatter`` ``bubble`` ``heatmap``
 Purpose-built:  ``radar`` ``pareto`` ``combo`` ``gantt`` ``progress``
 
+``feishu_chart_figure`` is the odd one out: it takes a list of panel specs and renders
+2-6 of them into ONE image with ``(a)`` ``(b)`` ``(c)`` tags and a single caption, the way
+a paper presents a multi-part figure.
+
 Every tool shares four arguments: ``document_id`` (empty = render the PNG only, e.g.
-to embed in Word/PPT or send with ``[SEND:path]``), ``caption`` (a "图N：…" line written
-under the chart), ``source`` (a data-provenance footnote), and ``user_key`` (the
-sender's open_id, needed when the doc is user-owned and the bot isn't a collaborator).
+to embed in Word/PPT or send with ``[SEND:path]``), ``caption`` (the caption text — the
+"图 N" prefix is added by the tool, continuing the numbering already in the document, so
+callers must NOT write their own "图N："), ``source`` (a data-provenance footnote), and
+``user_key`` (the sender's open_id, needed when the doc is user-owned and the bot isn't a
+collaborator).
 """
 
 from __future__ import annotations
@@ -28,8 +36,10 @@ from __future__ import annotations
 # RUF002: these docstrings are read by the agent (and by Chinese-speaking users) as
 # prose, so full-width CJK punctuation is correct typography here, not an ASCII typo.
 # ruff: noqa: RUF002
+import json
 import sys
 from pathlib import Path
+from typing import Any
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
@@ -41,7 +51,7 @@ import _chart_render as _cr
 # ── Part-of-whole ──────────────────────────────────────────────────────────────
 
 
-async def feishu_chart_pie(
+async def _render_pie(
     labels_json: str,
     values_json: str,
     title: str = "",
@@ -51,7 +61,9 @@ async def feishu_chart_pie(
     highlight: int = -1,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a pie chart to a Feishu doc — shares of a single whole.
 
@@ -59,7 +71,7 @@ async def feishu_chart_pie(
     split by department, headcount by function, traffic by channel. Slices are sorted
     largest-first with percentages on each; anything past the 6 biggest is folded into
     "其他" so labels stay legible (the response reports how many were folded). For more
-    categories, or to compare magnitudes precisely, use ``feishu_chart_bar`` instead —
+    categories, or to compare magnitudes precisely, use ``chart_type="bar"`` instead —
     people read bar length far more accurately than slice angle.
 
     Args:
@@ -71,10 +83,14 @@ async def feishu_chart_pie(
         unit: Value unit appended to numbers, e.g. "人" / "万元".
         show_values: Also print the raw value under each percentage (default false).
         highlight: 0-based index of the slice to pull out for emphasis; -1 for none.
-        caption: Optional caption paragraph written under the chart, e.g. "图1：人力分布".
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote, e.g. "HR 系统 2026-07".
         user_key: The sender's open_id (from ``<feishu_context>``); needed when the doc
             is user-owned and the bot isn't a collaborator.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -94,11 +110,19 @@ async def feishu_chart_pie(
         return _place.fail(str(exc))
     extra = {"folded_into_other": folded} if folded else None
     return await _place.place(
-        draw, kind="pie", title=title, document_id=document_id, caption=caption, user_key=user_key, extra=extra
+        draw,
+        kind="pie",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
+        extra=extra,
     )
 
 
-async def feishu_chart_donut(
+async def _render_donut(
     labels_json: str,
     values_json: str,
     title: str = "",
@@ -108,11 +132,13 @@ async def feishu_chart_donut(
     highlight: int = -1,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a donut chart to a Feishu doc — shares of a whole, with the total in the middle.
 
-    Same rules as ``feishu_chart_pie`` (2-6 categories, parts of one whole); prefer the
+    Same rules as ``chart_type="pie"`` (2-6 categories, parts of one whole); prefer the
     donut when the **total itself matters** — "1,240 万营收，华东占 42%" — because the hole
     displays that total instead of wasting the centre. Also reads better than a pie at
     small sizes in a dense report.
@@ -125,9 +151,13 @@ async def feishu_chart_donut(
         unit: Value unit, also applied to the centre total, e.g. "万元".
         show_values: Also print the raw value under each percentage.
         highlight: 0-based slice index to pull out; -1 for none.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -148,11 +178,19 @@ async def feishu_chart_donut(
         return _place.fail(str(exc))
     extra = {"folded_into_other": folded} if folded else None
     return await _place.place(
-        draw, kind="donut", title=title, document_id=document_id, caption=caption, user_key=user_key, extra=extra
+        draw,
+        kind="donut",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
+        extra=extra,
     )
 
 
-async def feishu_chart_funnel(
+async def _render_funnel(
     stages_json: str,
     values_json: str,
     title: str = "",
@@ -160,7 +198,9 @@ async def feishu_chart_funnel(
     unit: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a funnel chart to a Feishu doc — stage-by-stage drop-off in a fixed sequence.
 
@@ -175,9 +215,13 @@ async def feishu_chart_funnel(
         title: Chart title stating the takeaway ("注册→试用 是最大流失点").
         document_id: Target docx document_id; empty renders the PNG only.
         unit: Value unit, e.g. "人" / "单".
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         stages = _cr.parse_labels(stages_json, "stages")
@@ -186,14 +230,21 @@ async def feishu_chart_funnel(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="funnel", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="funnel",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
 # ── Trend over an ordered axis ─────────────────────────────────────────────────
 
 
-async def feishu_chart_line(
+async def _render_line(
     labels_json: str,
     series_json: str,
     title: str = "",
@@ -204,7 +255,9 @@ async def feishu_chart_line(
     zero_baseline: bool = False,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a line chart to a Feishu doc — how values move along an ordered axis.
 
@@ -225,9 +278,13 @@ async def feishu_chart_line(
         y_label: Y axis label, e.g. "营收（万元）".
         unit: Unit appended to axis ticks and the end-of-line value labels.
         zero_baseline: Force the y axis to start at 0 (default false).
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -245,11 +302,18 @@ async def feishu_chart_line(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="line", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="line",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_area(
+async def _render_area(
     labels_json: str,
     series_json: str,
     title: str = "",
@@ -259,7 +323,9 @@ async def feishu_chart_area(
     unit: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append an area chart to a Feishu doc — a trend whose accumulated volume matters.
 
@@ -267,7 +333,7 @@ async def feishu_chart_area(
     the magnitude under the curve carries meaning (累计用户量, 库存水位, 带宽占用); the fill
     always sits on a zero baseline, since a filled area above a truncated axis
     misrepresents volume. Three or more overlapping fills get muddy — use
-    ``feishu_chart_line`` for those, or ``feishu_chart_stacked_area`` for composition.
+    ``chart_type="line"`` for those, or ``chart_type="stacked_area"`` for composition.
 
     Args:
         labels_json: JSON array of x-axis points in order.
@@ -277,9 +343,13 @@ async def feishu_chart_area(
         x_label: X axis label.
         y_label: Y axis label.
         unit: Unit appended to axis ticks and end labels.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -298,11 +368,18 @@ async def feishu_chart_area(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="area", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="area",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_stacked_area(
+async def _render_stacked_area(
     labels_json: str,
     series_json: str,
     title: str = "",
@@ -313,7 +390,9 @@ async def feishu_chart_stacked_area(
     percent: bool = False,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a stacked area chart to a Feishu doc — composition changing over time.
 
@@ -333,9 +412,13 @@ async def feishu_chart_stacked_area(
         y_label: Y axis label; defaults to "占比" when percent is true.
         unit: Unit appended to axis ticks (ignored when percent is true).
         percent: Normalise each period to 100% to show mix rather than volume.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -353,14 +436,21 @@ async def feishu_chart_stacked_area(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="stacked-area", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="stacked-area",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
 # ── Comparison across categories ───────────────────────────────────────────────
 
 
-async def feishu_chart_column(
+async def _render_column(
     labels_json: str,
     values_json: str,
     title: str = "",
@@ -372,14 +462,16 @@ async def feishu_chart_column(
     highlight: int = -1,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a vertical column chart to a Feishu doc — compare a value across categories.
 
     The safest default for comparing magnitudes: bar length is judged far more
     accurately than angle or area. Use for **up to ~8 categories with short names**
     (部门人数, 各月工单量); beyond that, or with long Chinese names, use
-    ``feishu_chart_bar`` (horizontal) so labels stay readable. Every bar is labelled
+    ``chart_type="bar"`` (horizontal) so labels stay readable. Every bar is labelled
     with its value and starts at zero. ``highlight`` greys the rest to spotlight one
     category — useful when the doc is arguing about that one.
 
@@ -393,9 +485,13 @@ async def feishu_chart_column(
         unit: Unit appended to bar labels and axis ticks.
         sort_desc: Sort bars by value, largest first — do this for rankings.
         highlight: 0-based index to emphasise (others greyed); -1 for none.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -416,11 +512,18 @@ async def feishu_chart_column(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="column", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="column",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_bar(
+async def _render_bar(
     labels_json: str,
     values_json: str,
     title: str = "",
@@ -432,11 +535,13 @@ async def feishu_chart_bar(
     highlight: int = -1,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a horizontal bar chart to a Feishu doc — rankings and long category names.
 
-    Prefer this over ``feishu_chart_column`` whenever there are **many categories
+    Prefer this over ``chart_type="column"`` whenever there are **many categories
     (8+)** or the names are long Chinese phrases (区域名, 部门全称, 缺陷类型): horizontal
     bars give labels a full line each instead of rotating them into unreadable
     diagonals. Sorted largest-first by default, which is what makes a ranking scannable.
@@ -451,9 +556,13 @@ async def feishu_chart_bar(
         unit: Unit appended to bar labels and axis ticks.
         sort_desc: Sort by value, largest at top (default true).
         highlight: 0-based index to emphasise (others greyed); -1 for none.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -475,11 +584,18 @@ async def feishu_chart_bar(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="bar", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="bar",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_grouped_column(
+async def _render_grouped_column(
     labels_json: str,
     series_json: str,
     title: str = "",
@@ -490,7 +606,9 @@ async def feishu_chart_grouped_column(
     horizontal: bool = False,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a grouped (clustered) column chart — compare 2-4 series side by side.
 
@@ -509,9 +627,13 @@ async def feishu_chart_grouped_column(
         y_label: Value axis label.
         unit: Unit appended to bar labels and axis ticks.
         horizontal: Draw horizontally for long category names.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -529,11 +651,18 @@ async def feishu_chart_grouped_column(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="grouped-column", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="grouped-column",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_stacked_column(
+async def _render_stacked_column(
     labels_json: str,
     series_json: str,
     title: str = "",
@@ -545,7 +674,9 @@ async def feishu_chart_stacked_column(
     horizontal: bool = False,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a stacked column chart — category totals **and** their internal composition.
 
@@ -553,7 +684,7 @@ async def feishu_chart_stacked_column(
     各部门人数按职级. ``percent=true`` makes every column 100% tall, which compares
     **mix** across categories of very different sizes (that's the right choice when
     "大区之间结构差异" is the question, not "谁的总量大"). To compare individual components
-    precisely, use ``feishu_chart_grouped_column`` — stacked segments don't share a
+    precisely, use ``chart_type="grouped_column"`` — stacked segments don't share a
     baseline, so only the bottom one is easy to read. Values must be non-negative.
 
     Args:
@@ -566,9 +697,13 @@ async def feishu_chart_stacked_column(
         unit: Unit appended to axis ticks (ignored when percent is true).
         percent: Normalise each column to 100% to compare composition.
         horizontal: Draw horizontally for long category names.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -588,11 +723,18 @@ async def feishu_chart_stacked_column(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="stacked-column", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="stacked-column",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_waterfall(
+async def _render_waterfall(
     labels_json: str,
     deltas_json: str,
     title: str = "",
@@ -602,7 +744,9 @@ async def feishu_chart_waterfall(
     total_label: str = "合计",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a waterfall (bridge) chart — how a starting value becomes an ending value.
 
@@ -620,9 +764,13 @@ async def feishu_chart_waterfall(
         y_label: Value axis label.
         unit: Unit appended to labels and axis ticks, e.g. "万".
         total_label: Name of the final closing bar (default "合计").
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -633,14 +781,21 @@ async def feishu_chart_waterfall(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="waterfall", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="waterfall",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
 # ── Distribution & correlation ─────────────────────────────────────────────────
 
 
-async def feishu_chart_histogram(
+async def _render_histogram(
     values_json: str,
     title: str = "",
     document_id: str = "",
@@ -650,7 +805,9 @@ async def feishu_chart_histogram(
     unit: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a histogram — the **shape** of one variable's distribution.
 
@@ -658,7 +815,7 @@ async def feishu_chart_histogram(
     接口响应耗时. This is the chart that exposes what an average hides — a long tail, two
     clusters, a wall at a SLA boundary. Mean and median lines are drawn so skew is
     visible. Pass the **raw observations**, not pre-counted buckets; to compare
-    distributions across groups use ``feishu_chart_box``.
+    distributions across groups use ``chart_type="box"``.
 
     Args:
         values_json: JSON array of raw numeric observations (at least 2), e.g. '[3,4,4,5,7,12]'.
@@ -668,9 +825,13 @@ async def feishu_chart_histogram(
         x_label: Measured-variable label, e.g. "处理时长（小时）".
         y_label: Count axis label (default "频数").
         unit: Unit appended to axis ticks and the mean/median labels.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         values = _cr.parse_values(values_json)
@@ -680,11 +841,18 @@ async def feishu_chart_histogram(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="histogram", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="histogram",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_box(
+async def _render_box(
     groups_json: str,
     title: str = "",
     document_id: str = "",
@@ -693,14 +861,16 @@ async def feishu_chart_box(
     unit: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a box plot — compare **distributions** across groups, not just their averages.
 
     Use when "平均值差不多" would be misleading: 各部门响应时长, 各产线良率, 各校招批次评分.
     Each box shows median, quartiles, whiskers and outliers, so a group that looks
     average but is wildly inconsistent stands out. Every group needs at least 2
-    observations; for a single group's shape use ``feishu_chart_histogram``.
+    observations; for a single group's shape use ``chart_type="histogram"``.
 
     Args:
         groups_json: JSON object of group→raw observations, e.g.
@@ -710,9 +880,13 @@ async def feishu_chart_box(
         x_label: Group axis label.
         y_label: Measured-variable label, e.g. "响应时长（小时）".
         unit: Unit appended to axis ticks.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         parsed = _cr.parse_series(groups_json, "groups")
@@ -720,11 +894,18 @@ async def feishu_chart_box(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="box", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="box",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_scatter(
+async def _render_scatter(
     points_json: str,
     title: str = "",
     document_id: str = "",
@@ -734,7 +915,9 @@ async def feishu_chart_scatter(
     point_labels_json: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a scatter plot — does one variable move with another?
 
@@ -755,9 +938,13 @@ async def feishu_chart_scatter(
         trend: Overlay a least-squares trend line (default true).
         point_labels_json: Optional JSON array naming each point (single-group only),
             e.g. '["A店","B店","C店"]'. Only use for small sets, or labels overlap.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         groups = _cr.parse_point_groups(points_json)
@@ -774,11 +961,18 @@ async def feishu_chart_scatter(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="scatter", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="scatter",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_bubble(
+async def _render_bubble(
     points_json: str,
     title: str = "",
     document_id: str = "",
@@ -788,7 +982,9 @@ async def feishu_chart_bubble(
     labels_json: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a bubble chart — three variables at once (x, y, and bubble size).
 
@@ -796,7 +992,7 @@ async def feishu_chart_bubble(
     vs 营收规模, 优先级 vs 工作量 vs 影响用户数. Bubble **area** scales with the third value
     (area, not radius — that's what the eye actually judges). Keep to ~12 bubbles; more
     and they overlap into noise. If the third variable isn't important, use
-    ``feishu_chart_scatter``.
+    ``chart_type="scatter"``.
 
     Args:
         points_json: JSON array of [x,y,size] triples, e.g. '[[10,22,300],[15,30,800]]'.
@@ -806,9 +1002,13 @@ async def feishu_chart_bubble(
         y_label: Y variable label with unit.
         size_label: What bubble size means — shown as a footnote so the reader isn't guessing.
         labels_json: Optional JSON array naming each bubble, e.g. '["A","B","C"]'.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         points = _cr.parse_points(points_json, dims=3)
@@ -827,11 +1027,18 @@ async def feishu_chart_bubble(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="bubble", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="bubble",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_heatmap(
+async def _render_heatmap(
     row_labels_json: str,
     col_labels_json: str,
     values_json: str,
@@ -842,7 +1049,9 @@ async def feishu_chart_heatmap(
     show_values: bool = True,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a heatmap — intensity across a two-dimensional grid.
 
@@ -860,9 +1069,13 @@ async def feishu_chart_heatmap(
         unit: Unit appended to cell values.
         color_label: Colourbar label — what the intensity measures.
         show_values: Print each cell's number (default true; auto-skipped above 120 cells).
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         rows = _cr.parse_labels(row_labels_json, "row_labels")
@@ -881,14 +1094,21 @@ async def feishu_chart_heatmap(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="heatmap", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="heatmap",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
 # ── Purpose-built ──────────────────────────────────────────────────────────────
 
 
-async def feishu_chart_radar(
+async def _render_radar(
     axes_json: str,
     series_json: str,
     title: str = "",
@@ -896,7 +1116,9 @@ async def feishu_chart_radar(
     max_value: float = 0,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a radar (spider) chart — a multi-dimension profile at a glance.
 
@@ -914,9 +1136,13 @@ async def feishu_chart_radar(
         document_id: Target docx document_id; empty renders the PNG only.
         max_value: Scale ceiling, e.g. 5 for a 1-5 rating; 0 derives it from the data.
             Set this explicitly for ratings so the shape isn't exaggerated by autoscaling.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         axes_labels = _cr.parse_labels(axes_json, "axes")
@@ -925,11 +1151,18 @@ async def feishu_chart_radar(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="radar", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="radar",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_pareto(
+async def _render_pareto(
     labels_json: str,
     values_json: str,
     title: str = "",
@@ -939,7 +1172,9 @@ async def feishu_chart_pareto(
     threshold: float = 80.0,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a Pareto chart — which few causes drive most of the effect (80/20).
 
@@ -957,9 +1192,13 @@ async def feishu_chart_pareto(
         y_label: Value axis label, e.g. "工单数".
         unit: Unit appended to axis ticks.
         threshold: Cumulative-percentage cut to mark (default 80).
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -970,11 +1209,18 @@ async def feishu_chart_pareto(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="pareto", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="pareto",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_combo(
+async def _render_combo(
     labels_json: str,
     bar_series_json: str,
     line_series_json: str,
@@ -987,7 +1233,9 @@ async def feishu_chart_combo(
     line_percent: bool = False,
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a combo chart — volume as bars plus a rate as a line on a second axis.
 
@@ -1009,9 +1257,13 @@ async def feishu_chart_combo(
         unit: Unit for the bar axis ticks, e.g. "万".
         line_unit: Unit for the line axis ticks (ignored when line_percent is true).
         line_percent: Format the right axis as percentages (default false).
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         labels = _cr.parse_labels(labels_json)
@@ -1032,11 +1284,18 @@ async def feishu_chart_combo(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="combo", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="combo",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_gantt(
+async def _render_gantt(
     tasks_json: str,
     title: str = "",
     document_id: str = "",
@@ -1044,7 +1303,9 @@ async def feishu_chart_gantt(
     today: str = "",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append a Gantt chart — project schedule as task bars along a time axis.
 
@@ -1063,9 +1324,13 @@ async def feishu_chart_gantt(
         document_id: Target docx document_id; empty renders the PNG only.
         start_date: Optional YYYY-MM-DD for day 0 of the axis; defaults to the earliest task.
         today: Optional YYYY-MM-DD to draw the "今天" line; empty draws no line.
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         tasks, tick_labels, today_offset = _cr.parse_gantt_tasks(tasks_json, start_date, today)
@@ -1073,11 +1338,18 @@ async def feishu_chart_gantt(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="gantt", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="gantt",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )
 
 
-async def feishu_chart_progress(
+async def _render_progress(
     items_json: str,
     title: str = "",
     document_id: str = "",
@@ -1085,7 +1357,9 @@ async def feishu_chart_progress(
     unit: str = "%",
     caption: str = "",
     source: str = "",
+    auto_number: bool = True,
     user_key: str = "",
+    identity: str = "",
 ) -> str:
     """Append progress/attainment bars — actual against a target, per item.
 
@@ -1101,9 +1375,13 @@ async def feishu_chart_progress(
         document_id: Target docx document_id; empty renders the PNG only.
         target: The goal every item is measured against (default 100).
         unit: Unit for the values, e.g. "%" / "万" / "人" (default "%").
-        caption: Caption paragraph written under the chart.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
         source: Data provenance footnote.
         user_key: The sender's open_id; needed for user-owned docs.
+        identity: ``"user"`` / ``"bot"`` -- who owns the chart's document (see feishu_doc_create).
     """
     try:
         items = _cr.parse_pairs(items_json, "items")
@@ -1111,5 +1389,298 @@ async def feishu_chart_progress(
     except _cr.ChartDataError as exc:
         return _place.fail(str(exc))
     return await _place.place(
-        draw, kind="progress", title=title, document_id=document_id, caption=caption, user_key=user_key
+        draw,
+        kind="progress",
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
+    )
+
+
+# ── Combined figures ───────────────────────────────────────────────────────────
+
+
+async def feishu_chart_figure(
+    panels_json: str,
+    layout: str = "horizontal",
+    figure_title: str = "",
+    document_id: str = "",
+    caption: str = "",
+    source: str = "",
+    auto_number: bool = True,
+    panel_sources: bool = False,
+    user_key: str = "",
+    identity: str = "",
+) -> str:
+    """Append 2-6 related charts as ONE figure — panels side by side, under one caption.
+
+    Use this when several views answer **one** question and belong together: 营收趋势 +
+    渠道占比 + 区域排名 as "上半年经营概览", or 本期 vs 上期 of the same metric. The panels
+    render into a single image, each tagged ``(a)`` ``(b)`` ``(c)``, with one numbered
+    caption below naming them — the layout academic papers use for multi-part figures.
+    Because it is one image block, the panels can never drift apart from each other or
+    from their caption the way separately-inserted charts do.
+
+    Use the single-chart tools instead when the charts answer *different* questions —
+    unrelated charts crammed into one figure share a caption that can't describe either.
+
+    Args:
+        panels_json: JSON array of 2-6 panel objects. Each needs ``chart`` (one of: pie,
+            donut, funnel, line, area, stacked_area, column, bar, grouped_column,
+            stacked_column, waterfall, histogram, box, scatter, bubble, heatmap, radar,
+            pareto, combo, gantt, progress) plus that chart's data fields, named like the
+            single-chart tool's arguments without the ``_json`` suffix — ``labels``,
+            ``values``, ``series``, ``points``, ``tasks``, ``items``… Each panel also takes
+            its own ``title`` (shown above that panel and reused in the caption), and the
+            same optional knobs as its tool (``unit``, ``x_label``, ``percent``, …). E.g.
+            '[{"chart":"line","title":"营收趋势","labels":["1月","2月"],"series":{"营收":[120,145]}},
+              {"chart":"pie","title":"渠道占比","labels":["直销","线上"],"values":[62,38]}]'
+        layout: ``"horizontal"`` (one row, for comparing panels), ``"vertical"`` (one
+            column, for a sequence), or ``"grid"`` (near-square; use for 4+ panels).
+        figure_title: Optional title for the whole figure, stating the combined takeaway.
+        document_id: Target docx document_id (or a wiki node's obj_token). Empty renders
+            the PNG only and returns its path.
+        caption: Caption text WITHOUT a number — write "各区域经营概况", not "图3：…". The
+            "图 N" prefix is added automatically, continuing the document's own sequence,
+            and the panel names are appended as "(a) …；(b) …".
+        source: Data provenance footnote for the whole figure, e.g. "财务台账 2026-07".
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
+        panel_sources: Also print each panel's own ``source`` under that panel (default
+            false — one shared ``source`` for the figure is usually right, and repeating
+            it per panel is noise). Use when panels genuinely come from different systems.
+        user_key: The sender's open_id (from ``<feishu_context>``); needed when the doc
+            is user-owned and the bot isn't a collaborator.
+        identity: ``"user"`` / ``"bot"`` -- who owns the figure's document (see feishu_doc_create).
+    """
+    try:
+        draws, panel_titles = _cr.parse_panels(panels_json, panel_source=panel_sources)
+    except _cr.ChartDataError as exc:
+        return _place.fail(str(exc))
+    return await _place.place_figure(
+        draws,
+        panel_titles=panel_titles,
+        layout=layout,
+        figure_title=figure_title,
+        source=source,
+        document_id=document_id,
+        caption=caption,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
+    )
+
+
+# ── Dispatch ───────────────────────────────────────────────────────────────────
+# One public tool instead of 21. Each renderer above keeps its own signature; the
+# table below is the only place that knows which data keys and options it takes, so
+# adding a chart type means one row plus a renderer, not a new tool schema.
+#
+# `data` keys are required; `opts` keys are optional. Both are named exactly as the
+# renderer's parameters, so dispatch is a plain **kwargs call with no translation.
+
+_CHART_SPECS: dict[str, dict[str, Any]] = {
+    "pie": {"fn": _render_pie, "data": ["labels_json", "values_json"], "opts": ["unit", "show_values", "highlight"]},
+    "donut": {
+        "fn": _render_donut,
+        "data": ["labels_json", "values_json"],
+        "opts": ["unit", "show_values", "highlight"],
+    },
+    "funnel": {"fn": _render_funnel, "data": ["stages_json", "values_json"], "opts": ["unit"]},
+    "line": {
+        "fn": _render_line,
+        "data": ["labels_json", "series_json"],
+        "opts": ["x_label", "y_label", "unit", "zero_baseline"],
+    },
+    "area": {"fn": _render_area, "data": ["labels_json", "series_json"], "opts": ["x_label", "y_label", "unit"]},
+    "stacked_area": {
+        "fn": _render_stacked_area,
+        "data": ["labels_json", "series_json"],
+        "opts": ["x_label", "y_label", "unit", "percent"],
+    },
+    "column": {
+        "fn": _render_column,
+        "data": ["labels_json", "values_json"],
+        "opts": ["x_label", "y_label", "unit", "sort_desc", "highlight"],
+    },
+    "bar": {
+        "fn": _render_bar,
+        "data": ["labels_json", "values_json"],
+        "opts": ["x_label", "y_label", "unit", "sort_desc", "highlight"],
+    },
+    "grouped_column": {
+        "fn": _render_grouped_column,
+        "data": ["labels_json", "series_json"],
+        "opts": ["x_label", "y_label", "unit", "horizontal"],
+    },
+    "stacked_column": {
+        "fn": _render_stacked_column,
+        "data": ["labels_json", "series_json"],
+        "opts": ["x_label", "y_label", "unit", "percent", "horizontal"],
+    },
+    "waterfall": {
+        "fn": _render_waterfall,
+        "data": ["labels_json", "deltas_json"],
+        "opts": ["y_label", "unit", "total_label"],
+    },
+    "histogram": {"fn": _render_histogram, "data": ["values_json"], "opts": ["bins", "x_label", "y_label", "unit"]},
+    "box": {"fn": _render_box, "data": ["groups_json"], "opts": ["x_label", "y_label", "unit"]},
+    "scatter": {
+        "fn": _render_scatter,
+        "data": ["points_json"],
+        "opts": ["x_label", "y_label", "trend", "point_labels_json"],
+    },
+    "bubble": {
+        "fn": _render_bubble,
+        "data": ["points_json"],
+        "opts": ["x_label", "y_label", "size_label", "labels_json"],
+    },
+    "heatmap": {
+        "fn": _render_heatmap,
+        "data": ["row_labels_json", "col_labels_json", "values_json"],
+        "opts": ["unit", "color_label", "show_values"],
+    },
+    "radar": {"fn": _render_radar, "data": ["axes_json", "series_json"], "opts": ["max_value"]},
+    "pareto": {"fn": _render_pareto, "data": ["labels_json", "values_json"], "opts": ["y_label", "unit", "threshold"]},
+    "combo": {
+        "fn": _render_combo,
+        "data": ["labels_json", "bar_series_json", "line_series_json"],
+        "opts": ["y_label", "y2_label", "unit", "line_unit", "line_percent"],
+    },
+    "gantt": {"fn": _render_gantt, "data": ["tasks_json"], "opts": ["start_date", "today"]},
+    "progress": {"fn": _render_progress, "data": ["items_json"], "opts": ["target", "unit"]},
+}
+
+
+def _spec_summary(chart_type: str) -> str:
+    """The data/options contract for one chart type, for use in an error message."""
+    spec = _CHART_SPECS[chart_type]
+    data = ", ".join(spec["data"])
+    opts = ", ".join(spec["opts"]) or "(none)"
+    return f"data_json keys: {data} | options_json keys: {opts}"
+
+
+def _coerce_data_values(raw: dict[str, Any]) -> dict[str, str]:
+    """Re-serialize each data value to the JSON *string* the renderers parse.
+
+    The caller writes ``{"labels_json": ["a","b"]}`` — the natural form — but the
+    renderers take strings and parse them themselves (that parsing carries the
+    per-chart validation). A value already given as a string is passed through, so
+    both spellings work.
+    """
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        out[key] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return out
+
+
+async def feishu_chart(
+    chart_type: str,
+    data_json: str,
+    title: str = "",
+    options_json: str = "",
+    document_id: str = "",
+    caption: str = "",
+    source: str = "",
+    auto_number: bool = True,
+    user_key: str = "",
+    identity: str = "",
+) -> str:
+    """Render a data chart and append it to a Feishu doc (or return the PNG path).
+
+    Feishu's docx API has no chart block, so the chart is rendered as a house-styled
+    PNG and placed as a native image block. With *document_id* empty you get the PNG
+    only — useful for embedding in Word/PPT or sending with ``[SEND:path]``.
+
+    **Picking the right chart is the hard part** and this tool will not do it for you:
+    read the ``feishu-charts`` skill, which maps the question being asked to a
+    *chart_type* and states each one's preconditions. A wrong chart type renders
+    cleanly and still misleads.
+
+    Args:
+        chart_type: Which chart. Part-of-whole: ``pie`` ``donut`` ``funnel``. Trend:
+            ``line`` ``area`` ``stacked_area``. Comparison: ``column`` ``bar``
+            ``grouped_column`` ``stacked_column`` ``waterfall``. Distribution:
+            ``histogram`` ``box`` ``scatter`` ``bubble`` ``heatmap``. Purpose-built:
+            ``radar`` ``pareto`` ``combo`` ``gantt`` ``progress``. For a multi-panel
+            figure use ``feishu_chart_figure`` instead.
+        data_json: JSON object holding this chart type's data, e.g. for ``pie``
+            ``'{"labels_json":["研发","市场"],"values_json":[42,28]}'``. Each chart type
+            takes different keys — an unknown or missing key is reported with the exact
+            list it expects. Values may be given as arrays or as JSON strings.
+        title: Chart title — state the takeaway ("研发占人力一半"), not just the dimension.
+        options_json: JSON object of per-type extras, e.g.
+            ``'{"unit":"人","show_values":true}'``. Valid keys depend on *chart_type*;
+            an unknown key is rejected with the accepted list rather than ignored.
+        document_id: Target docx document_id (or a wiki node's obj_token). Empty renders
+            the PNG only and returns its path.
+        caption: Caption text WITHOUT a number — write "人力分布", not "图1：人力分布".
+            The "图 N" prefix is added automatically, continuing the document's sequence.
+        source: Data provenance footnote, e.g. "HR 系统 2026-07".
+        auto_number: Number the caption from the document's existing 图 captions
+            (default true). Set false only when the caller manages numbering itself.
+        user_key: The sender's open_id (from ``<feishu_context>``); needed when the doc
+            is user-owned and the bot isn't a collaborator.
+        identity: ``"user"`` / ``"bot"`` — who owns the chart's document.
+    """
+    kind = (chart_type or "").strip().lower()
+    if kind not in _CHART_SPECS:
+        if kind in ("figure", "panels", "combined"):
+            return _place.fail("multi-panel figures have their own tool: use feishu_chart_figure(panels_json=…).")
+        return _place.fail(
+            f"unknown chart_type {chart_type!r}. Pick one of: {', '.join(sorted(_CHART_SPECS))}. "
+            "The feishu-charts skill maps the question being asked to the right one."
+        )
+
+    spec = _CHART_SPECS[kind]
+    try:
+        raw_data = json.loads(data_json) if (data_json or "").strip() else {}
+    except json.JSONDecodeError as exc:
+        return _place.fail(f"data_json is not valid JSON: {exc}. Expected an object — {_spec_summary(kind)}.")
+    if not isinstance(raw_data, dict):
+        return _place.fail(
+            f"data_json must be a JSON object keyed by field name, got {type(raw_data).__name__}. {_spec_summary(kind)}"
+        )
+    try:
+        raw_opts = json.loads(options_json) if (options_json or "").strip() else {}
+    except json.JSONDecodeError as exc:
+        return _place.fail(f"options_json is not valid JSON: {exc}. {_spec_summary(kind)}")
+    if not isinstance(raw_opts, dict):
+        return _place.fail(f"options_json must be a JSON object, got {type(raw_opts).__name__}.")
+
+    data = _coerce_data_values({str(k): v for k, v in raw_data.items()})
+    missing = [key for key in spec["data"] if key not in data]
+    if missing:
+        return _place.fail(f"chart_type={kind!r} needs {missing} in data_json. {_spec_summary(kind)}")
+    unknown_data = [key for key in data if key not in spec["data"]]
+    if unknown_data:
+        return _place.fail(
+            f"data_json has {unknown_data}, which chart_type={kind!r} does not take. {_spec_summary(kind)}"
+        )
+    unknown_opts = [key for key in raw_opts if key not in spec["opts"]]
+    if unknown_opts:
+        return _place.fail(
+            f"options_json has {unknown_opts}, which chart_type={kind!r} does not take. {_spec_summary(kind)}"
+        )
+
+    # `point_labels_json` / `labels_json` are options on some types but still want the
+    # array-or-string flexibility the data keys get.
+    opts = {
+        key: (json.dumps(v, ensure_ascii=False) if key.endswith("_json") and not isinstance(v, str) else v)
+        for key, v in raw_opts.items()
+    }
+
+    return await spec["fn"](
+        **data,
+        **opts,
+        title=title,
+        document_id=document_id,
+        caption=caption,
+        source=source,
+        auto_number=auto_number,
+        user_key=user_key,
+        identity=identity,
     )

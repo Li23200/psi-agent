@@ -26,6 +26,13 @@ class AiInfo:
     model: str
     api_key: str
     base_url: str
+    max_context_tokens: int = -1
+    """Prompt token threshold that triggers compaction.
+
+    ``-1`` keeps ``Ai``'s own resolution (``PSI_MAX_CONTEXT_TOKENS`` env var,
+    else 100K); ``0`` disables compaction.  Defaulted so state snapshots
+    written before this field existed still restore.
+    """
 
 
 @dataclass
@@ -50,12 +57,27 @@ class AIManager:
         base_url: str,
         *,
         id: str = "",
+        max_context_tokens: int = -1,
     ) -> AiInfo:
-        ai_id = id or _new_uuid()
+        want_key = self._config_key(provider, model, api_key, base_url)
+        explicit_id = id.strip()
+        ai_id = explicit_id or _new_uuid()
         async with self._lock:
             logger.debug(f"AIManager: acquired lock for create {ai_id!r}")
             if ai_id in self._entries:
                 raise ValueError(f"AI {ai_id!r} already exists")
+            # No explicit id: reuse an already-running identical config (dedupe).
+            # Explicit id (Session revive) may still create a second instance with
+            # the same provider/model/key so the Session keeps its backend_id.
+            if not explicit_id:
+                for entry in self._entries.values():
+                    info = entry.info
+                    if self._config_key(info.provider, info.model, info.api_key, info.base_url) == want_key:
+                        logger.info(
+                            f"AI create: reusing identical config as {info.id!r} "
+                            f"(provider={provider!r} model={model!r})"
+                        )
+                        return info
             socket = _socket_path(self._prefix, "ais", ai_id)
             await _ensure_socket_dir(socket)
             ai = Ai(
@@ -64,6 +86,7 @@ class AIManager:
                 model=model,
                 api_key=api_key,
                 base_url=base_url,
+                max_context_tokens=max_context_tokens,
             )
             scope = anyio.CancelScope()
 
@@ -79,7 +102,15 @@ class AIManager:
 
             logger.debug(f"AIManager: starting AI {ai_id!r} task")
             self._tg.start_soon(_run_ai)
-            info = AiInfo(id=ai_id, socket=socket, provider=provider, model=model, api_key=api_key, base_url=base_url)
+            info = AiInfo(
+                id=ai_id,
+                socket=socket,
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                max_context_tokens=max_context_tokens,
+            )
             self._entries[ai_id] = _AiEntry(scope=scope, info=info)
         try:
             await _wait_socket(info.socket)
@@ -95,6 +126,10 @@ class AIManager:
         await self._persist()
         logger.info(f"AI {ai_id!r} created on {info.socket}")
         return info
+
+    @staticmethod
+    def _config_key(provider: str, model: str, api_key: str, base_url: str) -> tuple[str, str, str, str]:
+        return (provider, model, api_key, base_url.rstrip("/"))
 
     async def delete(self, ai_id: str) -> None:
         async with self._lock:

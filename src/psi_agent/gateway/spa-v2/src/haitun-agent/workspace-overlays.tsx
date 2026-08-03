@@ -4,6 +4,7 @@ import {
   Download,
   FileArchive,
   FileText,
+  FolderOpen,
   Grid2X2,
   MessageCircle,
   Settings2,
@@ -12,10 +13,11 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArtifactFileBody } from "../components/ArtifactFileBody";
-import { readWorkspaceFile } from "../services/api";
 import {
   downloadChatFile,
+  ensureChatFileData,
   findDeliverableFile,
+  revealDeliverableInFolder,
 } from "../utils/filePreviewUtils";
 import { mobileHaptic, prefersReducedMotion } from "./client-feedback";
 import type { ChatFile, Task } from "./model";
@@ -24,7 +26,14 @@ import { TreasureVisual } from "./primitives";
 function fileIcon(name: string) {
   const n = name.toLowerCase();
   if (n.endsWith(".xlsx") || n.endsWith(".xls") || n.endsWith(".csv")) return <Grid2X2 size={17} />;
-  if (n.endsWith(".pdf") || n.endsWith(".md") || n.endsWith(".markdown") || n.endsWith(".txt")) {
+  if (
+    n.endsWith(".pdf")
+    || n.endsWith(".md")
+    || n.endsWith(".markdown")
+    || n.endsWith(".txt")
+    || n.endsWith(".docx")
+    || n.endsWith(".doc")
+  ) {
     return <FileText size={17} />;
   }
   return <FileArchive size={17} />;
@@ -64,6 +73,7 @@ export function ArtifactDrawer({
   const [loadedFiles, setLoadedFiles] = useState<ChatFile[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [revealBusy, setRevealBusy] = useState(false);
   const acceptTimer = useRef<number | null>(null);
 
   useEffect(() => {
@@ -83,17 +93,25 @@ export function ArtifactDrawer({
   const selectedName = fileNames[selectedFile] ?? "";
   const selectedBlob = useMemo(() => {
     if (!selectedName) return undefined;
-    return findDeliverableFile(selectedName, files)
-      ?? findDeliverableFile(selectedName, loadedFiles);
-  }, [selectedName, files, loadedFiles]);
+    const fromLive = findDeliverableFile(selectedName, files);
+    const fromDisk = findDeliverableFile(selectedName, loadedFiles);
+    // Prefer a payload with data (live SSE or lazy-loaded); else keep path stub.
+    if (fromLive?.data.trim()) return fromLive;
+    if (fromDisk?.data.trim()) return fromDisk;
+    return fromDisk ?? fromLive ?? (
+      task.deliverablePaths[selectedName]
+        ? { name: selectedName, data: "", path: task.deliverablePaths[selectedName] }
+        : undefined
+    );
+  }, [selectedName, files, loadedFiles, task.deliverablePaths]);
 
   useEffect(() => {
-    if (!selectedName || selectedBlob) {
+    if (!selectedName || selectedBlob?.data.trim()) {
       setLoadError(null);
       setLoading(false);
       return;
     }
-    const path = task.deliverablePaths[selectedName];
+    const path = selectedBlob?.path?.trim() || task.deliverablePaths[selectedName];
     if (!path) {
       setLoadError("历史记录中没有该文件的路径，无法从工作区读取。");
       return;
@@ -101,12 +119,12 @@ export function ArtifactDrawer({
     let cancelled = false;
     setLoading(true);
     setLoadError(null);
-    void readWorkspaceFile(path, workspaceRoot)
+    void ensureChatFileData({ name: selectedName, data: "", path }, workspaceRoot)
       .then((res) => {
         if (cancelled) return;
         setLoadedFiles((current) => {
-          const rest = current.filter((f) => f.name !== res.name);
-          return [...rest, { name: res.name, data: res.data }];
+          const rest = current.filter((f) => f.name !== res.name && f.name !== selectedName);
+          return [...rest, res];
         });
       })
       .catch((e) => {
@@ -119,7 +137,7 @@ export function ArtifactDrawer({
     return () => {
       cancelled = true;
     };
-  }, [selectedName, selectedBlob, task.deliverablePaths, workspaceRoot]);
+  }, [selectedName, selectedBlob?.data, selectedBlob?.path, task.deliverablePaths, workspaceRoot]);
 
   const acceptWithCelebration = () => {
     if (accepting || empty || !task.newDeliverables.length) return;
@@ -132,7 +150,40 @@ export function ArtifactDrawer({
   };
 
   const handleDownload = () => {
-    if (selectedBlob) downloadChatFile(selectedBlob);
+    if (!selectedName) return;
+    const blob = selectedBlob;
+    if (blob?.data.trim()) {
+      downloadChatFile(blob);
+      return;
+    }
+    const path = blob?.path || task.deliverablePaths[selectedName];
+    if (!path) {
+      setLoadError("历史记录中没有该文件的路径，无法下载。");
+      return;
+    }
+    void ensureChatFileData({ name: selectedName, data: "", path }, workspaceRoot)
+      .then((loaded) => {
+        setLoadedFiles((current) => {
+          const rest = current.filter((f) => f.name !== loaded.name && f.name !== selectedName);
+          return [...rest, loaded];
+        });
+        downloadChatFile(loaded);
+      })
+      .catch((e) => {
+        setLoadError(e instanceof Error ? e.message : String(e));
+      });
+  };
+
+  const revealPath = selectedBlob?.path?.trim() || task.deliverablePaths[selectedName] || "";
+  const handleReveal = () => {
+    if (!revealPath || revealBusy) return;
+    setRevealBusy(true);
+    setLoadError(null);
+    void revealDeliverableInFolder(revealPath, workspaceRoot)
+      .catch((e) => {
+        setLoadError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => setRevealBusy(false));
   };
 
   const kicker = empty
@@ -196,19 +247,31 @@ export function ArtifactDrawer({
 
             <div className="document-preview">
               <div className="document-toolbar">
-                <span className="document-toolbar-label" title={selectedName}>
+                <span className="document-toolbar-label" title={revealPath || selectedName}>
                   预览 · {selectedName || "未选择"}
                 </span>
-                <button
-                  type="button"
-                  disabled={!selectedBlob}
-                  onClick={handleDownload}
-                  aria-label={`下载 ${selectedName}`}
-                >
-                  <Download size={16} />
-                </button>
+                <div className="document-toolbar-actions">
+                  <button
+                    type="button"
+                    disabled={!revealPath || revealBusy}
+                    onClick={handleReveal}
+                    title={revealPath ? (revealBusy ? "正在打开…" : "在文件夹中显示") : "无磁盘路径，无法定位"}
+                    aria-label={`在文件夹中显示 ${selectedName}`}
+                  >
+                    <FolderOpen size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!selectedBlob?.data.trim() && !selectedBlob?.path && !task.deliverablePaths[selectedName]}
+                    onClick={handleDownload}
+                    aria-label={`下载 ${selectedName}`}
+                    title="下载"
+                  >
+                    <Download size={16} />
+                  </button>
+                </div>
               </div>
-              {selectedBlob ? (
+              {selectedBlob?.data.trim() ? (
                 <ArtifactFileBody key={`${selectedBlob.name}:${selectedBlob.data.slice(0, 32)}`} file={selectedBlob} />
               ) : loading ? (
                 <div className="artifact-preview-missing">

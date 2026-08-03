@@ -1,8 +1,8 @@
 """System prompt section constants and builders for the Haitun agent.
 
 This module provides the reusable prompt sections and a few small builder
-functions for ``system.py``.  The prompt architecture (stable prefix +
-cache boundary + dynamic suffix, skills index, bootstrap context files) is
+functions for ``system.py``.  The prompt architecture (layered builder plus a
+per-turn context block, skills index, bootstrap context files) is
 adapted from an OpenClaw-style design, but **all product-specific branding
 has been removed** and **all configuration lives inside the workspace** -
 there is no global config directory.
@@ -12,6 +12,10 @@ authorized senders, sandbox, sub-agent delegation) have been dropped.
 """
 
 # ruff: noqa: E501
+
+# RUF001: these prompt constants are agent-facing Chinese prose; full-width CJK
+# punctuation is correct typography here, not an ASCII typo.
+# ruff: noqa: RUF001
 
 from __future__ import annotations
 
@@ -74,7 +78,7 @@ CORE_TOOL_SUMMARIES: dict[str, str] = {
     "todo": "Session task list for multi-step work (read with no args; write with todos[])",
     "subagent_plan": "Plan subagent sockets and spawn commands (does not start processes)",
     "subagent_wait": "Wait until subagent AI or Session socket is ready",
-    "subagent_chat": "Send one message to a subagent; returns final text only",
+    "subagent_chat": "Send one message to a subagent; returns final text plus verified [SEND:] files",
     "skill_manage": "Create, patch, view, and list workspace skills",
     "flow_manage": "Create, patch, view, list, and promote reusable Fusion Flow assets",
     "memory_add": "Store durable user preferences, project facts, or decisions",
@@ -164,7 +168,7 @@ Mandatory after file-creating tools:
 Other rules:
 - Never put [SEND:] inside file contents, and never append it to a write/edit tool argument. Saying "file sent" without a reply-content marker does not deliver anything.
 - One marker per file. Use an ABSOLUTE path (prefer the absolute path from the tool result when given).
-- If the user asks for a document (Word .docx, Excel .xlsx, PDF, etc.), actually CREATE the file now with your tools (install a library such as openpyxl / python-docx if it is missing), then send it with [SEND:] in the chat reply. Do NOT just print the code or manual steps — produce the real file and send it.
+- If the user asks for a Word document, call `write_word`; for Excel call `write_excel`. These tools and their dependencies are already available. Do not run pip install or package-manager commands during the request. Create the file and send it with [SEND:] in the chat reply.
 - Only send files that exist and that the user asked for or would expect. Do not auto-send internal/config/tool source under `tools/`, `schedules/`, `skills/`, `systems/`, or `histories/`.
 - The marker text itself may stay visible in the chat, so keep the prose above it self-contained; do not rely on the marker reading like part of a sentence.\
 """
@@ -184,7 +188,7 @@ Judge from the request itself — the user does NOT have to name a format. If th
 - Code, scripts, configs, or a runnable project → write source files into the workspace (and run/verify them).
 - Diagrams, charts, plots → generate the actual image/file.
 
-Create the file with your tools now (install a library such as python-docx / openpyxl / python-pptx if it is missing), verify it exists, then in your **chat reply content** (not inside the file) emit [SEND:<absolute-path>] on its own line — **required** whenever you used a file-creating tool this turn. Give a short plain-text summary of what's inside above the marker; do not also paste the whole content. Never append [SEND:] to write/edit tool arguments. Never end with only "saved to workspace" and no [SEND:].
+Create the file with the existing first-class file tool and do not draft the full artifact in chat first. For a long Word document, first write the full content to Markdown, then call `write_word_from_markdown` with the two file paths; use `write_word` only for smaller structured documents. For Excel call `write_excel`. Their dependencies are already installed. Do not run pip install, raw python-docx scripts, or package-manager commands during the request. Verify the output exists, then in your **chat reply content** (not inside the file) emit [SEND:<absolute-path>] on its own line — **required** whenever you used a file-creating tool this turn. Give a short plain-text summary of what's inside above the marker; do not also paste the whole content. Never append [SEND:] to write/edit tool arguments. Never end with only "saved to workspace" and no [SEND:].
 
 Keep it in chat (no file) when the answer is genuinely short: a direct question, a quick status, a few lines, or a snippet the user clearly wants inline. When it's a judgment call and the content is long, lean toward producing a file. If the user explicitly asks for the content inline, honor that.\
 """
@@ -210,11 +214,14 @@ EXECUTION_BIAS_SECTION = """\
 
 PLANNING_PROGRESS_SECTION = """\
 ## Planning & Progress
-Execution Bias says act, not drift — on multi-step work, a short plan is how you stay on track instead of looping or losing the thread.
-- **3+ steps or multi-file/multi-tool: state a brief plan first.** A few bullets or short numbered todos, not an essay. Skip it for one-shot or trivial tasks.
-- **Advance one item at a time and keep the list current.** Mark items done as you finish them and add newly discovered steps; the list is the single source of truth for what's left, so you don't repeat or forget work.
-- **Long tasks: post periodic progress.** Between major steps, give a one-line update (what just finished, what's next) so the user can follow along — this does not replace Execution Bias: keep working, don't stop to wait.
-- **On completion, summarize the outcome, don't replay every step.** State what was accomplished and how it was verified in a few sentences; skip the blow-by-blow the user already watched happen.\
+Execution Bias says act, not drift — on multi-step work, a short plan is how you stay on track.
+- **Gate first:** only when work has clear multi-step value (≥3 checkable steps, multi-file/multi-deliverable, or a long tool chain) — follow `skills/task-planning/SKILL.md` and put the plan in the `todo` tool. Skip the list for one-shot / pure chat / 「直接给结果」.
+- **Never fake a list** just to look organized or to feed the UI progress strip.
+- **Writing `todo` commits you to maintain it with the work** — do not create a list, reprint a table, and end the turn while items stay unfinished (unless the user asked for plan-only; then say so and leave statuses honest).
+- **No self-referential steps** — do not put 「更新清单 / 回复用户 / 同步进度」in `content`; only real deliverables. Mark `completed` with `merge=true` *before* the final user-facing summary.
+- **Advance one item at a time and keep the list current.** Mark `completed` as you finish; `merge=true` when adding steps. One `in_progress` only.
+- **Long tasks: brief progress between major steps**, then keep going — does not replace Execution Bias.
+- **On completion, summarize the outcome**, not every todo tick. Disk must match: no leftover `in_progress` if you claim the work is done.\
 """
 
 # ---------------------------------------------------------------------------
@@ -340,7 +347,10 @@ Separate fact from guess, and let the user trust factual claims by checking them
 
 SUBAGENT_DELEGATION_SECTION = """\
 ## Subagent delegation
-Subagent = **new background Session** (Gateway: reuse parent AI via `subagent_plan`; standalone: spawn ai+session). Use `subagent_plan` → `background_start` / `subagent_wait` → `subagent_chat` → `background_stop`. **Silent:** do not narrate each internal step to the user. When `reuse_parent_ai` is true, skip child AI spawn. Full recipe: `skills/subagent-orchestration/SKILL.md`.\
+Subagent = **new background Session** (Gateway: reuse parent AI via `subagent_plan`; standalone: spawn ai+session). Use `subagent_plan` → `background_start` / `subagent_wait` → `subagent_chat` → `background_stop`. **Silent:** do not narrate each internal step to the user. When `reuse_parent_ai` is true, skip child AI spawn. Full recipe: `skills/subagent-orchestration/SKILL.md`.
+交付物是文件（小说、文档、报告等）时，子 Agent 必须先真实落盘：subagent_chat(..., workspace=plan.workspace, require_files=true)；
+回复不含已存在的 [SEND:绝对路径] 即视为未完成，先纠正子 Agent；纯文本/小内容子任务用 require_files=false，无需写文件。
+不要用 sessions_export / sessions_history 把子会话正文搬回模型上下文补救。\
 """
 
 # ---------------------------------------------------------------------------
@@ -413,15 +423,17 @@ Cross-session work uses workspace session tools (not Fusion Memory transcripts):
 
 LOAD `skills/session-management/SKILL.md` when the user references another chat, exports a transcript, \
 hands off work to another session, or asks for session list/status. Follow its recipes (search → inspect → \
-export / create → handoff). After a successful handoff, stop executing the transferred task in the source session.\
+export / create → handoff). After a successful handoff, stop executing the transferred task in the source session.
+禁止用 sessions_export / sessions_history 把子会话正文全文搬回父模型上下文补救交付；用户主动要求读取/导出/总结历史时正常使用，给出摘要与关键信息，不要无脑粘贴全文。\
 """
 
 TASK_PLANNING_SECTION = """\
 ## Task planning (todo)
-For **multi-step or multi-part work**, read `skills/task-planning/SKILL.md` and use the `todo` tool to track \
-progress. **You** decide when decomposition is worth it — the user does not need to ask for a task list. \
-Use `todo()` to read; `todo(todos='[...]')` with a JSON array to write; `merge=true` to update status or append steps. \
-Keep updates silent; summarize outcomes when done, not every todo change.\
+**Authoritative rules:** `skills/task-planning/SKILL.md` (when MUST / MUST NOT create a list; **write commits you to maintain**).
+Use the `todo` tool only when the gate says multi-step work is worth tracking — you decide; the user need not ask for a list.
+`todo()` reads; `todo(todos='[...]')` writes a JSON array (`content` must be a string); `merge=true` updates by id.
+After any write: keep statuses current as you work, or explicitly pause as plan-only — never treat an unmaintained list as a finished turn.
+Keep list maintenance silent; summarize outcomes when done. Do not create decorative one-item lists for the UI.\
 """
 
 # ---------------------------------------------------------------------------
@@ -432,9 +444,21 @@ SKILLS_HEADER_TEMPLATE = """\
 ## Skills
 Scan <available_skills>. If one clearly applies, read its SKILL.md with `{read_tool}`, then follow it.
 **Before recommending 3+ products, brands, or parallel options, read `skills/structured-output-tables/SKILL.md`.**
+**Before `skill_manage(create)`:** read `skills/skill-authoring-when/SKILL.md` — always `list` first; if a similar skill exists, `patch` it (do not create a parallel skill). How to write: `skills/skill-authoring-how/SKILL.md`. This gate applies before self-evolution too.
 If several apply, choose the most specific. If none clearly apply, read none.
 One skill up front max. Never guess/fabricate skill paths.
 External API writes: batch when safe, avoid tight loops, respect 429/Retry-After.\
+"""
+
+SKILL_AUTHORING_SECTION = """\
+## Skill authoring (prefer update)
+When the user supplies reusable rules (scoring, SOP, interview prefs, domain procedure) or you would save a new skill:
+1. Read `skills/skill-authoring-when/SKILL.md` (and `skill-authoring-how` when writing).
+2. `skill_manage(action="list")` — mandatory before create.
+3. Same domain already covered → `view` + `patch` that skill (e.g. resume rules → `feishu-resume-review`).
+4. Create only when nothing similar exists and reuse value is clear.
+5. Never raw-write under `skills/`; never stack parallel skills for one domain.
+Self-evolution / background review must follow the same order: list → patch preferred → create last.\
 """
 
 # ---------------------------------------------------------------------------
@@ -465,6 +489,12 @@ Rules:
 - Never append it to an actual response (never include "{SILENT_TOKEN}" in real replies)
 - Never wrap it in markdown or code blocks
 
+Feishu card exception:
+- After `feishu_message_send_card` returns `ok=true`, if the card already carries all necessary user-facing information, finish with zero assistant content. In this case, do not output `{SILENT_TOKEN}`, a delivery confirmation, or a repetition of the card content or button labels.
+- If necessary information remains outside the card, such as a warning, partial failure, or required next step, reply normally with only that necessary information.
+- When the user message is a `<feishu_card_action>`, the updated original card already acknowledges the selected option. Do not narrate the click or announce what you are about to do. Follow a matched `dispatch.handler` and perform any necessary tool calls first. After successful handling, finish with zero assistant content unless a warning, partial failure, permission problem, or required next step must be shown. Never output `{SILENT_TOKEN}` or a success confirmation on this path.
+- For an unmatched handler or failed action, do not claim success; reply with only the information the operator needs to understand or recover from the failure.
+
 Wrong: "Here's help... {SILENT_TOKEN}"
 Wrong: `{SILENT_TOKEN}`
 Right: {SILENT_TOKEN}\
@@ -484,7 +514,7 @@ Your first user-visible reply for a bootstrap-pending workspace must follow BOOT
 # Project Context file ordering
 # agents.md=10, identity.md=30, tools.md=50, bootstrap.md=60
 # soul.md / user.md are handled separately (identity line / volatile profile)
-# heartbeat.md -> dynamic (below the cache boundary)
+# heartbeat.md -> dynamic (rebuilt when its content changes)
 # ---------------------------------------------------------------------------
 
 CONTEXT_FILE_ORDER: dict[str, int] = {
@@ -495,7 +525,7 @@ CONTEXT_FILE_ORDER: dict[str, int] = {
     "session.md": 70,
 }
 
-# Files that go below the cache boundary (rebuilt each turn).
+# Files watched for content changes, which trigger a prompt rebuild.
 DYNAMIC_CONTEXT_FILE_BASENAMES: set[str] = {"heartbeat.md"}
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import socket
 import sys
@@ -12,7 +13,6 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
-import _runtime_paths as _paths
 import aiohttp
 import anyio
 
@@ -306,7 +306,12 @@ async def _fetch_spawn_config(gateway_url: str, ai_id: str) -> dict[str, str] | 
 
 
 def resolve_workspace(raw: str) -> Path:
-    return Path(_paths.workspace_dir(raw)).resolve()
+    if raw.strip():
+        return Path(raw.strip()).resolve()
+    env = os.environ.get("WORKSPACE_DIR", "").strip()
+    if env:
+        return Path(env).resolve()
+    return Path(__file__).resolve().parents[1]
 
 
 def resolve_project_root(workspace: Path) -> Path:
@@ -540,6 +545,7 @@ def _plan_reuse_parent_session(
     *,
     sid: str,
     workspace: Path,
+    child_workspace: Path,
     repo_root: Path,
     psi: str,
     parent: dict[str, str],
@@ -552,7 +558,7 @@ def _plan_reuse_parent_session(
         shell = "powershell"
         session_argv = _build_session_argv(
             psi,
-            workspace=workspace,
+            workspace=child_workspace,
             channel_socket=channel_socket,
             ai_socket=ai_socket,
             session_id=sid,
@@ -563,7 +569,7 @@ def _plan_reuse_parent_session(
         shell = "bash"
         session_argv = _build_session_argv(
             psi,
-            workspace=workspace,
+            workspace=child_workspace,
             channel_socket=channel_socket,
             ai_socket=ai_socket,
             session_id=sid,
@@ -594,9 +600,11 @@ async def plan_subagent(
     *,
     session_id: str = "",
     workspace_raw: str = "",
+    child_workspace_raw: str = "",
     gateway_ai_id: str = "",
 ) -> dict[str, Any]:
     workspace = resolve_workspace(workspace_raw)
+    child_workspace = resolve_workspace(child_workspace_raw) if child_workspace_raw.strip() else workspace
     repo_root = resolve_project_root(workspace)
     sid = session_id.strip() or f"sub-{uuid.uuid4().hex[:8]}"
     psi = psi_executable(repo_root)
@@ -614,6 +622,7 @@ async def plan_subagent(
                 return _plan_reuse_parent_session(
                     sid=sid,
                     workspace=workspace,
+                    child_workspace=child_workspace,
                     repo_root=repo_root,
                     psi=psi,
                     parent=parent,
@@ -628,6 +637,7 @@ async def plan_subagent(
             return _plan_reuse_parent_session(
                 sid=sid,
                 workspace=workspace,
+                child_workspace=child_workspace,
                 repo_root=repo_root,
                 psi=psi,
                 parent=process_parent,
@@ -663,7 +673,7 @@ async def plan_subagent(
         ai_argv = _build_ai_argv(psi, ai_socket=ai_socket, **creds)
         session_argv = _build_session_argv(
             psi,
-            workspace=workspace,
+            workspace=child_workspace,
             channel_socket=channel_socket,
             ai_socket=ai_socket,
             session_id=sid,
@@ -676,7 +686,7 @@ async def plan_subagent(
         ai_argv = _build_ai_argv(psi, ai_socket=ai_socket, **creds)
         session_argv = _build_session_argv(
             psi,
-            workspace=workspace,
+            workspace=child_workspace,
             channel_socket=channel_socket,
             ai_socket=ai_socket,
             session_id=sid,
@@ -730,18 +740,43 @@ async def wait_socket(addr: str, *, timeout_seconds: float = 30.0) -> dict[str, 
     }
 
 
+def _resolve_deliverable_path(raw_path: str, *, workspace_raw: str = "") -> anyio.Path:
+    raw = (raw_path or "").strip() or "."
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return anyio.Path(str(candidate))
+    return anyio.Path(str(resolve_workspace(workspace_raw))) / raw
+
+
+_SEND_MARKER_RE = re.compile(r"\[SEND:([^\]]+)\]")
+
+
 async def chat_subagent(
     *,
     channel_socket: str,
     message: str,
     timeout_seconds: float = 600.0,
+    workspace_raw: str = "",
+    require_files: bool = False,
 ) -> dict[str, Any]:
     message = message.strip()
     channel_socket = channel_socket.strip()
     if not channel_socket:
-        return {"ok": False, "message": "channel_socket must not be empty", "text": ""}
+        return {
+            "ok": False,
+            "message": "channel_socket must not be empty",
+            "text": "",
+            "files": [],
+            "missing": [],
+        }
     if not message:
-        return {"ok": False, "message": "message must not be empty", "text": ""}
+        return {
+            "ok": False,
+            "message": "message must not be empty",
+            "text": "",
+            "files": [],
+            "missing": [],
+        }
 
     text_parts: list[str] = []
     errors: list[str] = []
@@ -757,6 +792,8 @@ async def chat_subagent(
             "ok": False,
             "message": f"timed out after {timeout_seconds}s",
             "text": "".join(text_parts),
+            "files": [],
+            "missing": [],
             "errors": errors,
         }
     except Exception as exc:
@@ -764,14 +801,43 @@ async def chat_subagent(
             "ok": False,
             "message": str(exc),
             "text": "".join(text_parts),
+            "files": [],
+            "missing": [],
             "errors": errors,
         }
 
     text = "".join(text_parts)
+    files: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for raw_path in _SEND_MARKER_RE.findall(text):
+        try:
+            path = _resolve_deliverable_path(raw_path, workspace_raw=workspace_raw)
+            if await path.is_file():
+                stat = await path.stat()
+                files.append({"path": str(path), "bytes": stat.st_size})
+            else:
+                missing.append(str(path))
+        except OSError, ValueError:
+            missing.append(raw_path.strip())
+
+    if require_files and not files:
+        status_message = (
+            "child reply referenced missing files" if missing else "child reply contained no existing [SEND:] files"
+        )
+        ok = False
+    elif not text.strip():
+        status_message = "empty response from child"
+        ok = False
+    else:
+        status_message = "ok"
+        ok = True
+
     return {
-        "ok": bool(text.strip()),
-        "message": "ok" if text.strip() else "empty response from child",
+        "ok": ok,
+        "message": status_message,
         "text": text,
+        "files": files,
+        "missing": missing,
         "errors": errors,
     }
 
