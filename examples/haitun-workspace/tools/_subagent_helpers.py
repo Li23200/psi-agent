@@ -800,14 +800,12 @@ async def chat_subagent(
                 files.append({"path": str(path), "bytes": stat.st_size})
             else:
                 missing.append(str(path))
-        except (OSError, ValueError):
+        except OSError, ValueError:
             missing.append(raw_path.strip())
 
     if require_files and not files:
         status_message = (
-            "child reply referenced missing files"
-            if missing
-            else "child reply contained no existing [SEND:] files"
+            "child reply referenced missing files" if missing else "child reply contained no existing [SEND:] files"
         )
         ok = False
     elif not text.strip():

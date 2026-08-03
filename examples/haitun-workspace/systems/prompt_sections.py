@@ -13,6 +13,10 @@ authorized senders, sandbox, sub-agent delegation) have been dropped.
 
 # ruff: noqa: E501
 
+# RUF001: these prompt constants are agent-facing Chinese prose; full-width CJK
+# punctuation is correct typography here, not an ASCII typo.
+# ruff: noqa: RUF001
+
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
