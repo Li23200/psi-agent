@@ -121,6 +121,7 @@ import {
 
 import { TaskFocusDetails } from "./task-focus-details";
 import { FocusChatThread } from "./focus-chat-thread";
+import { ExecutionStepsPanel } from "./execution-steps-panel";
 
 import { ArtifactDrawer } from "./workspace-overlays";
 
@@ -166,7 +167,7 @@ export default function HaiTunAgentWorkspace({
   const [chatDrafts, setChatDrafts] = useState<Record<string, string>>({});
   const [chatAttachments, setChatAttachments] = useState<Record<string, File[]>>({});
   const [chatExpanded, setChatExpanded] = useState(false);
-  const [contextPanelCollapsed, setContextPanelCollapsed] = useState(false);
+  const [contextPanelCollapsed, setContextPanelCollapsed] = useState(true);
   const [typingCard, setTypingCard] = useState<string | null>(null);
   /** Growing process lines (规划下一步 + sealed steps); cleared when turn ends. */
   const [turnProgressLog, setTurnProgressLog] = useState<ProgressLog | null>(null);
@@ -502,7 +503,6 @@ export default function HaiTunAgentWorkspace({
 
   const collapseChat = useCallback(() => {
     setChatExpanded(false);
-    setContextPanelCollapsed(false);
     activeChatInputRef.current?.blur();
   }, []);
 
@@ -552,7 +552,6 @@ export default function HaiTunAgentWorkspace({
       setDragX(0);
     }
     void ensureHistory(task.id);
-    setContextPanelCollapsed(false);
 
     if (chatExpanded) {
       // Already in focus: light content fade instead of swipe theater.
@@ -1410,6 +1409,15 @@ export default function HaiTunAgentWorkspace({
     const unitMessages = messages[unitCard.id] ?? [];
     const unitDraft = chatDrafts[unitCard.id] ?? "";
     const expanded = interactive ? chatExpanded : visualExpanded;
+    const unitBusy = typingCard === unitCard.id;
+    const unitHasDelivery = !!unitTask && unitTask.newDeliverables.length > 0;
+    const openUnitChest = () => {
+      if (!unitHasDelivery || !unitTask) {
+        showToast("暂无新交付物");
+        return;
+      }
+      openArtifact(unitTask, undefined, "new");
+    };
 
     return (
       <div className={`card-chat-unit ${expanded ? "chat-expanded" : ""} ${expanded && contextPanelCollapsed ? "context-collapsed" : ""}`}>
@@ -1507,15 +1515,6 @@ export default function HaiTunAgentWorkspace({
                   >
                     <PanelLeftOpen size={15} />
                   </button>
-                  <button
-                    type="button"
-                    className="context-panel-new-task context-panel-new-task-in-chat"
-                    onClick={() => openNewTask()}
-                    aria-label="新建任务"
-                  >
-                    <Plus size={15} />
-                    <span>新建任务</span>
-                  </button>
                 </>
               )}
               <AgentMark /><span>{expanded ? "任务工作区" : "关于"} <strong>{unitCard.title}</strong>{!expanded && " 的对话"}</span>
@@ -1523,11 +1522,45 @@ export default function HaiTunAgentWorkspace({
             <div className="quick-actions">
               {expanded && (
                 <>
+                  <span className="agent-status-tooltip-wrap">
+                    <button
+                      type="button"
+                      className={`chat-top-icon agent-status-icon ${unitBusy ? "busy" : ""}`}
+                      aria-label={unitBusy ? "Agent 正在思考执行任务" : "Agent 空闲"}
+                    >
+                      <History size={15} className="agent-status-clock" />
+                    </button>
+                    <span className="agent-status-tooltip" role="tooltip">
+                      {unitBusy ? "Agent 正在思考执行任务" : "Agent 空闲"}
+                    </span>
+                  </span>
+                  <span className="agent-status-tooltip-wrap">
+                    <button
+                      type="button"
+                      className={`chat-top-icon agent-status-icon ${unitBusy ? "busy" : ""}`}
+                      aria-label={unitBusy ? "Agent 正在思考执行任务" : "Agent 思考完成，任务空闲"}
+                    >
+                      <span className={`signal-orb ${unitBusy ? "red" : "green"}`} />
+                    </button>
+                    <span className="agent-status-tooltip" role="tooltip">
+                      {unitBusy ? "Agent 正在思考执行任务" : "Agent 思考完成，任务空闲"}
+                    </span>
+                  </span>
+                  <span className="agent-status-tooltip-wrap">
+                    <button
+                      type="button"
+                      className={`chat-top-icon agent-status-icon ${unitHasDelivery ? "has-delivery" : ""}`}
+                      onClick={openUnitChest}
+                      aria-label={unitHasDelivery ? "查看新交付物" : "暂无新交付物"}
+                    >
+                      <TreasureVisual state={unitHasDelivery ? "ready" : "none"} size="mini" />
+                    </button>
+                    <span className="agent-status-tooltip" role="tooltip">
+                      {unitHasDelivery ? "查看新交付物" : "暂无新交付物"}
+                    </span>
+                  </span>
                   <button type="button" className="chat-new-task" onClick={() => openNewTask()}>
                     <Plus size={13} /> 新建任务
-                  </button>
-                  <button type="button" className="chat-collapse" onClick={collapseChat}>
-                    <ChevronDown size={13} /> 收起
                   </button>
                 </>
               )}
@@ -1549,17 +1582,22 @@ export default function HaiTunAgentWorkspace({
           </div>
 
           {expanded && (
-            <FocusChatThread
-              messages={unitMessages}
-              typing={typingCard === unitCard.id}
-              title={unitCard.title}
-              progressLog={typingCard === unitCard.id ? turnProgressLog : null}
-              workspaceRoot={workspace}
-              loadingHistory={historyLoadingIds.has(unitCard.id)}
-              onFeedback={(index, kind) => setMessageFeedback(unitCard.id, index, kind)}
-              onRegenerate={(index) => void regenerateAgentMessage(unitCard.id, index)}
-              onRetry={(index) => void retryFailedMessage(unitCard.id, index)}
-            />
+            <>
+              <FocusChatThread
+                messages={unitMessages}
+                typing={typingCard === unitCard.id}
+                title={unitCard.title}
+                progressLog={typingCard === unitCard.id ? turnProgressLog : null}
+                workspaceRoot={workspace}
+                loadingHistory={historyLoadingIds.has(unitCard.id)}
+                onFeedback={(index, kind) => setMessageFeedback(unitCard.id, index, kind)}
+                onRegenerate={(index) => void regenerateAgentMessage(unitCard.id, index)}
+                onRetry={(index) => void retryFailedMessage(unitCard.id, index)}
+              />
+              {unitTask?.hasTodoTrack && (
+                <ExecutionStepsPanel steps={unitTask.steps} />
+              )}
+            </>
           )}
 
           {!expanded && <div className="latest-message">
