@@ -174,7 +174,8 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
 
 ### 免授权优先：手上有链接就直接读
 
-如果用户已经给了文档/wiki 链接，直接 `feishu_doc_read` / `feishu_wiki_get_node` 读即可，
+如果用户已经给了文档/wiki 链接，直接 `feishu_doc_read`（wiki 链接先用 `feishu_api` 打
+`GET /open-apis/wiki/v2/spaces/get_node` 换 `obj_token`）读即可，
 **不要多此一举去搜索或授权**。只有当诉求确实需要全库搜索（如「帮我在公司知识库找报销 SOP」
 而你手上没有链接）时，才用 `feishu_docs_search`（这一步才需授权）。
 
@@ -210,7 +211,8 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
 
   - **内嵌多维表格**：`feishu_doc_append_bitable(document_id, view_type, user_key, caption)`——
     内容是「一条条记录」（台账、问题列表、报名表：要字段类型、多视图、逐行协作）时用它，
-    返回 `app_token` / `table_id`，接着用 `feishu_bitable_create_field` / `_create_record` 建字段填数据。
+    返回 `app_token` / `table_id`，接着用 `feishu_api` 打 `POST /open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields`
+    建字段、`POST .../records` 填数据（多行用 `feishu_bitable_create_records`，它先核对列名）。
   - 流程图：`feishu_doc_append_flowchart(document_id, steps_json, title, user_key, caption)`——
     `steps_json` 是步骤数组 `["提交","审批","归档"]`。**飞书开放接口画不了真正的流程图块**
     （block_type 21 是空画布，API 填不进节点），所以用「单列表格 + ↓ 箭头」如实呈现，可编辑。
@@ -241,9 +243,11 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
     定位不到的 id 一律以 `not_found` 回报，**绝不猜序号**。块若是嵌套的（在表格单元格、
     高亮块里，看列块结果的 `parent_id`）要传 `parent_block_id`，留空即文档根。
     删除经 API 不可撤销，动手前先用 `list_blocks` 核对一下要删的正是那段文字。
-- **列出电子表格的工作表**：`feishu_sheet_tabs(token)` 返回每个工作表的
-  `sheet_id`/`title`/行列数。**`SHEET_ID` 不在表格 URL 里**，而所有区域都写成
-  `"SHEET_ID!A1:B2"`，所以不知道 `SHEET_ID` 时先调它，再去读写区域。
+- **列出电子表格的工作表**：走 `feishu-api` 技能的接口表——`feishu_api` 打
+  `GET /open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/query`，`data.sheets[]` 里
+  是每个工作表的 `sheet_id`/`title`/`index`，行列数在 `grid_properties` 里。**`SHEET_ID` 不在
+  表格 URL 里**，而所有区域都写成 `"SHEET_ID!A1:B2"`，所以不知道 `SHEET_ID` 时先打这个端点，
+  再去读写区域。`row_count` 是表格上限而不是有数据的行数，拿它当数据范围会读回一大片空行。
 - **读电子表格的一个区域**：`feishu_sheet_read(token, range, max_chars)`——只读指定区域
   （`feishu_doc_read(file_type="sheet", ...)` 是整本工作簿一次性倒出来，定位不了单格）。
   返回拍平成纯文本的行数组：**mention 单元格（`@某人`）和带样式的富文本都会拍成可见文字**，
@@ -257,19 +261,23 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
   `values_json` 是「行的数组」如 `'[["姓名","分数"],["张三",95],["合计","=SUM(B2:B2)"]]'`——**单元格值以 `=` 开头即写成公式**。
   写表格是写操作：带 `user_key=<sender_open_id>`，归属按上面「问归属」的结果走（`identity`
   留空即沿用记住的选择）。
-- **删除文档/文件**：`feishu_drive_delete_file(file_token, file_type, user_key)`——删除进
-  **回收站可恢复**。file_type 是 docx/doc/sheet/bitable/mindnote/slides/file/folder/shortcut。
-  删**知识库(wiki)里的文档**：飞书没有独立删 wiki 节点的接口——先 `feishu_wiki_get_node`
-  取 `obj_token`+`obj_type`，再 `feishu_drive_delete_file(file_token=obj_token, file_type=obj_type, user_key=...)`。
+- **删除文档/文件**：走 `feishu-drive` 技能的接口表——`DELETE /open-apis/drive/v1/files/:file_token`
+  带 `type`，删除进**回收站可恢复**。type 是 docx/doc/sheet/bitable/mindnote/slides/file/folder/shortcut。
+  删**知识库(wiki)里的文档**：飞书没有独立删 wiki 节点的接口——先 `feishu_api` 打
+  `GET /open-apis/wiki/v2/spaces/get_node` 取 `obj_token`+`obj_type`，再拿 `obj_token` 当
+  `file_token`、`obj_type` 当 `type` 删。
   删除不可轻率，动手前先跟用户确认清楚删的是哪一个。
-- **访问/浏览知识库**：`feishu_wiki_list_spaces` / `feishu_wiki_list_nodes` / `feishu_wiki_get_node`
+- **访问/浏览知识库**：`feishu_wiki_list_spaces` / `feishu_wiki_list_nodes` 两个列表工具
   已做「tenant 先试，返回空且带了 user_key 时自动改用户身份重试」。带上 `user_key=<sender_open_id>`：
   `feishu_wiki_list_spaces(user_key=...)` 列库 → `feishu_wiki_list_nodes(space_id, user_key=...)` 列文档
-  → `feishu_wiki_get_node(token, user_key=...)` 拿 obj_token → `feishu_doc_read` 读正文。
-  **不要因为一时返回空就说"企业没有知识库"**——确认带了 user_key 即可。
+  → `feishu_api` 打 `GET /open-apis/wiki/v2/spaces/get_node`（`query_json='{"token": …}'`）拿 obj_token
+  → `feishu_doc_read` 读正文。**不要因为一时返回空就说"企业没有知识库"**——两个列表工具确认带了
+  user_key 即可；而**节点详情那一步的空结果重试要你自己发起**（它走通用端点，没有那层自动重试）:
+  `data.node` 是空的就带 `user_key` 加 `prefer="user"` 再问一次，别当成节点不存在。
 - **读知识库里的 PDF/附件（下载）**：飞书文档 API 只能直接读 docx/doc/sheet；PDF、图片等要先下载再解析。
   `feishu_file_download(source, save_path, user_key=...)` 已 tenant 优先、机器人下不到时自动回退到用户身份。
-  流程：`feishu_wiki_get_node(token, user_key)` 拿 `obj_token` → `feishu_file_download`（带 user_key）
+  流程：`feishu_api` 打 `GET /open-apis/wiki/v2/spaces/get_node`（带 user_key）拿 `obj_token`
+  → `feishu_file_download`（带 user_key）
   存到本地 → 用 `read_pdf(pdf_path)` 抽文本（数字版 PDF 直接读文本层；扫描件/图片型 PDF 自动逐页
   渲染成图走 MiniMax 视觉 OCR，和 `describe_image` 同一套 `.env.multimodal` 凭据）。**下载失败不要直接让用户手动复制粘贴，
   先确认带了 user_key**；返回 `need_auth=True` 时才按上面分步引导授权。
@@ -280,14 +288,14 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
     本人名下；用机器人 tenant token 提交即可，**这一步不需要员工单独授权 UAT**（区别于文档搜索/知识库）。
     提交是对外动作，按 [`admin-finance-governance`] 先把拼好的表单给员工确认再提交；缺字段就问，绝不编造。
     **订阅审批状态变更（免轮询，主动推送）**：想在审批被通过/拒绝/撤销时第一时间通知申请人，
-    用 `feishu_approval_subscribe(approval_code)` 订阅该审批定义一次即可（每个定义订阅一次，重复调用无害）。
+    用 `feishu_api POST /open-apis/approval/v4/approvals/:approval_code/subscribe(approval_code)` 订阅该审批定义一次即可（每个定义订阅一次，重复调用无害）。
     订阅后飞书会在实例状态变化时把事件推给机器人，Haitun 自动私聊 DM 申请人本人告知最新状态——
     **不要再反复 `feishu_approval_get` 轮询**。收到审批事件（`<feishu_approval_event>`）时可先用
     `feishu_approval_get(instance_code)` 补充关键信息，再用一句自然的话把状态告诉申请人。
-    停止推送用 `feishu_approval_unsubscribe(approval_code)`。
+    停止推送用 `feishu_api POST /open-apis/approval/v4/approvals/:approval_code/unsubscribe(approval_code)`。
 12. **卡点找人（判定归属 + 给联系方式）**：员工私聊说"工作上卡在某个点了"，按 [`feishu-blocker-routing`]
     技能给他指路。先读一张**职责归属多维表格**（业务领域/职责 → 负责人 open_id）
-    `feishu_bitable_list_records(app_token, table_id)` 把卡点匹配到负责人，再用
+    （`feishu_api` 打 `GET /open-apis/bitable/v1/apps/:app_token/tables/:table_id/records`）把卡点匹配到负责人，再用
     `feishu_user_get(user_ids=<负责人 open_id>)` 取其**联系方式**（`mobile`/`email`/`enterprise_email`/
     `job_title`），回员工"①这归谁负责 ②去找谁 ③怎么联系"。台账里存的是姓名不是 open_id 时，
     最省事是 `feishu_contact_search(query=<姓名>)` **全局按名搜人**（不必先知道他在哪个群/部门，
@@ -302,30 +310,43 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
     传 `<feishu_context>` 的 `sender_open_id` 作为 `on_behalf_of`，收件人会看到「张三给你发了一条消息：「…」」
     这样清楚是谁托带的，**而不是机器人自己冒出来一句裸消息**。姓名由 open_id 自动解析，解析不到才回退
     成 open_id 本身。**只有代他人转达时才传 `on_behalf_of`**；机器人自己发的通知/看板/播报不要传（保持无前缀）。
-14. **把文件发回给飞书用户（关键：文件默认只在运行 Haitun 的这台机器上，飞书用户拿不到）**：
-    你下载、生成、转换出来的文件，默认只落在**运行 Haitun 的这台机器**的本地磁盘上。飞书用户和你
-    并不在同一台机器上——他们只通过飞书这条通道跟你连着——所以无论你部署在服务器、云主机还是某台
-    本地电脑上，用户都看不到、也拿不到这个本地文件。**想让用户真正收到文件，必须在回复正文里输出一个发送标记**：
+14. **把文件发回给用户（关键：文件默认只在运行 Haitun 的这台机器上，用户拿不到）**：
+    你下载、生成、转换出来的文件，默认只落在**运行 Haitun 的这台机器**的本地磁盘上。用户和你
+    并不在同一台机器上——他只通过当前这条通道（Web 控制台 / 飞书 / Telegram）跟你连着——所以无论
+    你部署在服务器、云主机还是某台本地电脑上，用户都看不到、也拿不到这个本地文件。**想让用户真正
+    收到文件，必须在回复正文里输出一个发送标记**：
 
     ```
     [SEND:<文件在本机的绝对路径>]
     ```
 
-    框架的 Channel 层会扫描这个标记，自动把该本地文件**上传发送到用户当前的飞书聊天窗口**
-    （先尝试当图片发，非图片则当附件文件发）。你只需保证：
+    框架的 Channel 层会扫描这个标记，自动把该本地文件**上传发送到用户当前所在的聊天窗口**
+    （先尝试当图片发，非图片则当附件文件发）。**通道是框架按用户当前所在位置自动选的，不由你挑**，
+    你也不需要知道现在是哪条通道。你只需保证：
     - 路径是**运行 Haitun 这台机器上的绝对路径**，且文件确实已经写好、存在；
     - 标记单独成行、路径两端不要加引号或多余空格，例如 `[SEND:/root/downloads/报表.xlsx]`；
     - 一次要发多个文件就输出多行、每行一个 `[SEND:...]`。
 
+    **绝不要拿 `feishu_*` 工具当交付手段**（这是真出过的事故：用户在 Web 控制台只让转换一个文档，
+    agent 却去 `feishu_chat_find("Haitun团队")` 想发到一个用户压根没提的飞书群）。`feishu_*` 的
+    发送/上传接口投递到**飞书**，那和「用户当前这个对话」是两个不同的目的地——用户在 Web 控制台时
+    永远收不到。判断依据很简单：
+    - 用户消息里有 `<feishu_context>` → 这一轮来自飞书；
+    - **没有**这个块 → 你**不在**飞书上（Web 控制台 / Telegram / CLI / 定时任务都属此类），
+      `feishu_*` 发出去的东西用户看不到。没看到就按「不在飞书」处理。
+    只有用户**明确要求**「发到某个飞书群/某个人/某篇文档」时才用 `feishu_*` 消息工具——那是一件
+    独立的任务，而不是「把文件发给我」的答案。
+
     典型场景：
     - 用户让你「下载群里那个附件给我」「把知识库这份 PDF 发我」——用 `feishu_file_download`
-      存到本地拿到 `save_path` 后，紧接着在回复里 `[SEND:<save_path>]` 把它发回给用户；
+      存到本地拿到 `save_path` 后，紧接着在回复里 `[SEND:<save_path>]` 把它发回给用户
+      （注意：`feishu_file_download` 是**读取**飞书上的文件，交付仍然靠 `[SEND:]`）；
     - 你用技能生成的产物（`powerpoint` 的 .pptx、`ocr-and-documents` 抽出的文本、`text_to_speech`
       的 MP3、图表/图片等）要交付给用户时，同样用 `[SEND:<绝对路径>]`。
 
     **不要**只把本地路径当文字念给用户（用户点不开也下不到），也**不要**因为「文件在你这台机器上」
     就说自己做不到发送——输出 `[SEND:...]` 即可。（在本地 REPL 里测试时看不到文件真正发出，属正常，
-    只有飞书/Telegram 等真实 Channel 才会执行上传。）
+    只有 Web 控制台/飞书/Telegram 等真实 Channel 才会执行上传。）
 15. **发交互式卡片（按钮/表单/选择器，比纯文本强太多）**：要让对方**动手操作**（同意/驳回、
     选项、提交表单值）而不只是读消息时，用 `feishu_message_send_card(receive_id=<对方>, card_json=<卡片JSON>)`
     发一张飞书消息卡片。卡片能带可点按钮、表单（输入框/下拉/日期选择器）、彩色标题、多列布局、图片、
@@ -349,15 +370,24 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
     都必须是无首尾空白的 canonical 字符串并精确匹配。配置了映射但 action 未命中时，
     `dispatch.matched=false` 且 `handler=null`；不得臆造或执行未匹配 handler。未配置映射的旧卡片才把
     `value.action` / `action_id` 本身作为兼容 handler；snapshot 缺失/损坏时一律 fail closed。首个回调会留下
-    持久 `.consumed` tombstone，因此不同 Channel 进程或重启后的重复点击也会被忽略。自定义 AppData 时 Channel
+    持久 `.consumed` tombstone，因此不同 Channel 进程或重启后的重复点击也会被忽略（`multi_use=True` 时墓碑
+    降为 per-action `{message_id}.{action}.consumed`，逐行各拒一次）。自定义 AppData 时 Channel
     和 Gateway/workspace tool 必须解析到同一根，推荐统一设置 `PSI_APPDATA`，否则回调拿不到业务上下文并安全失败。
     收到回调后把它视为用户提交的操作，但执行审批、写数据等有后果的动作前仍须复核操作者权限与当前业务状态；
     原卡片更新后的“已选择”提示已经完成点击确认，因此回调 agent 不得先生成“你点击了…”“我来处理/通知…”等过程文本；
     应先按匹配的 `dispatch.handler` 完成必要工具调用。handler 成功且无额外必要信息时以**零 assistant 文本**结束，
     不得输出 `NO_REPLY` 或成功确认。只有警告、部分失败、权限问题、未匹配 handler、必须执行的后续步骤等信息才回复，
     且不得把失败说成成功。
-    每张卡片只接受**第一个**有效按钮/表单操作：首次回调后 Channel 会保留原卡片标题和正文，把交互区替换为
-    “已选择: <选项>”只读提示，同一 `message_id` 的后续操作直接忽略；需要用户再次选择时必须发送一张新卡片。底层操作仍须保持
+    **默认**每张卡片只接受**第一个**有效按钮/表单操作：首次回调后 Channel 会保留原卡片标题和正文，把交互区替换为
+    “已选择: <选项>”只读提示，同一 `message_id` 的后续操作直接忽略；需要用户再次选择时必须发送一张新卡片。
+    **要一张卡承载多条各自独立勾选的待办时传 `multi_use=True`**：一次性的粒度从整张卡降到单个 `value.action`，
+    勾一行只结那一行（渲染成 `● ~~文字~~` 并原地更新卡片）、其余行按钮保留，重复点同一行仍恰好被拒一次
+    （跨进程、跨重启有效）。此时每行的 `action` **必须唯一且规范**（无首尾空白），撞名会让两行互相顶掉，
+    没有可用 action id 的行会退回整卡去重、退化成普通单次卡。连点会被 Channel 合并成一个回合，
+    你会收到 `<feishu_card_action_batch count="N">` 包住 N 条 `<feishu_card_action>`：**每条都要逐个处理
+    （漏一条就丢一次动作），但只回一条消息**。同意/驳回一类「第二个答案必须不可能」的卡片一律留 `False`。
+    标准「今日待办清单」直接用 `feishu_todo_card_send`（见 `feishu-todo-card` skill），不必自己拼多选卡。
+    底层操作仍须保持
     **idempotent**，以防飞书重投、卡片更新失败或多实例并发。工具返回 `ok=true` 后卡片已直接对用户可见；若卡片
     已承载全部必要信息，本轮以**零 assistant 文本**结束，不要输出 `NO_REPLY`、确认“卡片已发送”，也不要重复卡片
     内容或按钮名称。只有仍有卡片未承载的必要信息时才继续回复，例如风险提示、部分失败或必须执行的后续步骤；
@@ -372,12 +402,14 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
     只有纯机器人自建、没有具体发起人时才留空（此时机器人当群主）。`user_ids` 传的是 **open_id 不是姓名**——先用
     `feishu_chat_find_member`（从别的群）或 `feishu_department_members` 把姓名反查成 open_id（单次最多 50 人，
     超了先建再补拉）。返回里的 `invalid_user_ids` 是飞书没能加进来的人（多为不在通讯录权限范围内），如实反馈。
-17. **从零建一张多维表格（没有现成台账可写时）**：`feishu_bitable_create_record` 等工具都要一个**已存在**的
-    `app_token`；用户说"建个台账/跟踪表/登记表"而手里没有链接时，别让他先自己去飞书里建表，按三步自己建：
-    1. `feishu_bitable_create_app(name=<表名>, user_key=<sender_open_id>)` 建**表格本体**，返回 `app_token`、
-       `url`（把这个链接回给用户，他才点得进去）和 `default_table_id`（飞书自动建的那张空表，只有一个占位列）。
-       归属按上面「问归属」的结果走：归用户则表在他自己的云空间里；归机器人则表建在机器人云空间、
-       用户默认看不到（这种情况记得把 `url` 回给他，或用 `feishu_permission_add_member` 加他为协作者）。
+17. **从零建一张多维表格（没有现成台账可写时）**：写数据都要一个**已存在**的
+    `app_token`；用户说"建个台账/跟踪表/登记表"而手里没有链接时，别让他先自己去飞书里建表，按三步自己建。
+    多维表格的端点表在 **`feishu-bitable` 技能**里，读它再用 `feishu_api` 调；下面只说流程和坑。
+    1. `feishu_api` POST `/open-apis/bitable/v1/apps`（body `{"name":"<表名>"}`）建**表格本体**，返回
+       `app_token`、`url`（把这个链接回给用户，他才点得进去）和 `default_table_id`（飞书自动建的那张空表，
+       只有一个占位列）。归属按上面「问归属」的结果走：归用户则表在他自己的云空间里；归机器人则表建在
+       机器人云空间、用户默认看不到（这种情况记得把 `url` 回给他，或按 `feishu-permission` 技能
+       加他为协作者）。
     2. `feishu_bitable_create_table(app_token, table_name, fields_json=...)` 建**真正要用的数据表连列一起**——
        `fields_json` 是 `[{"field_name":"合同编号","type":1},{"field_name":"金额","type":2},
        {"field_name":"状态","type":3,"property":{"options":[{"name":"生效","color":0}]}},
@@ -385,24 +417,25 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
        1 文本、2 数字、3 单选、4 多选、5 日期、7 复选框、11 人员、13 电话、15 超链接、17 附件、20 公式、
        22 地理位置、1001 创建时间、1005 自动编号（19 查找引用建不了）。**第一个字段是索引列**，只能是
        1/2/5/13/15/20/22，所以把文本类主键（编号/名称）放第一个，别拿"人员/单选"开头（飞书报 1254012）。
-       建完 `default_table_id` 那张空表用不上，`feishu_bitable_clear_table` / `feishu_bitable_delete_fields`
-       收拾干净或直接留着，别把数据写进它。
+       建完 `default_table_id` 那张空表用不上，`feishu_bitable_clear_table` 或 `feishu_api` DELETE
+       `.../tables/:table_id/fields/:field_id` 收拾干净或直接留着，别把数据写进它。
     3. 填数据：**多行一次写完**用 `feishu_bitable_create_records(app_token, table_id, records_json)`
        （`records_json` 是 `[{"姓名":"张三","状态":"在读"},{"姓名":"李四"}]`，单次 500 行、一张表上限
-       20000 行），别 for 循环单条调 `create_record`——那样慢还容易撞飞书限流。只写一行才用
-       `feishu_bitable_create_record`。列名必须和上一步一致。
-    **已有一张建好的标准台账时别从零重建**：`feishu_bitable_copy_app(app_token, name, without_content=True)`
-    直接复制一份（`without_content=True` 只复制结构不复制数据），这就是"模板"的用法。
-    事后要加列用 `feishu_bitable_create_field(app_token, table_id, field_name, field_type, property_json)`；
+       20000 行），别 for 循环单条调单行接口——那样慢还容易撞飞书限流。只写一行才用 `feishu_api` POST
+       `.../tables/:table_id/records`。列名必须和上一步一致。
+    **已有一张建好的标准台账时别从零重建**：`feishu_api` POST `/open-apis/bitable/v1/apps/:app_token/copy`
+    （body 带 `without_content: true`）直接复制一份（只复制结构不复制数据），这就是"模板"的用法。
+    事后要加列用 `feishu_api` POST `.../tables/:table_id/fields`；
     列**建错了别删了重建**（删列连数据一起丢），用 `feishu_bitable_update_field(app_token, table_id,
     field_id, field_name, field_type, property_json)` 改名/改类型/改选项。要一次加好几张空表用
-    `feishu_bitable_create_tables(app_token, table_names="合同,付款,发票")`；整张表连数据一起删用
-    `feishu_bitable_delete_tables`（**破坏性、API 撤不回，删前跟用户确认**；只清数据留结构用
-    `clear_table`；一张多维表格至少留一张表，删最后一张飞书报 1254034）。
-    要"同一张表不同人看到不同内容"用 `feishu_bitable_create_role` + `feishu_bitable_add_role_member`——这需要
-    表上**开了高级权限**，先 `feishu_bitable_get_app(app_token)` 看 `is_advanced`，没开用
-    `feishu_bitable_update_app(app_token, is_advanced="true")` 开（wiki 里的表和嵌在文档里的表开不了，
-    报 1254301）；`update_app` 也能给表格本体改名。
+    `feishu_api` POST `.../tables/batch_create`；整张表连数据一起删用 `feishu_api` POST
+    `.../tables/batch_delete`（**破坏性、API 撤不回**，所以端点表要求带 `confirm='DELETE_BITABLE_TABLES'`，
+    删前跟用户确认；只清数据留结构用 `feishu_bitable_clear_table`；一张多维表格至少留一张表，
+    删最后一张飞书报 1254034）。
+    要"同一张表不同人看到不同内容"用 `feishu_api` POST `.../roles` + POST `.../roles/:role_id/members`——这需要
+    表上**开了高级权限**，先 `feishu_api` GET `/open-apis/bitable/v1/apps/:app_token` 看 `is_advanced`，没开用
+    `feishu_api` PUT `/open-apis/bitable/v1/apps/:app_token`（body `{"is_advanced": true}`）开（wiki 里的表和
+    嵌在文档里的表开不了，报 1254301）；同一个 PUT 也能给表格本体改名。
     表名/列名一律**按用户说的建，缺信息就问**，别自己编一套字段糊上去。
 18. **撤回发错的消息**：用户说"把刚才那条撤回/撤销/删掉""发错了"时，用
     `feishu_message_recall(message_id=<om_...>, user_key=<sender_open_id>)`。`message_id` 只能是**消息 id**
@@ -413,17 +446,18 @@ feishu_auth_request(user_key=<sender_open_id>, capabilities=<工具给的 need_c
     这两类失败工具都会在结果里带一句 `hint` 说明卡在哪，**如实转告用户**，别反复重试或谎称已撤回。
     撤回是"让这条消息不该存在"；只是**内容写错**就别撤回重发，用下面第 20 条的编辑。
 19. **改多维表格里已有的格子（改状态/改错的值/补空格，不是新增一行）**：用户说"把张三那行状态改成
-    已完成""金额写错了改成 12000""把这几行都标记成已归档"时，**别用 `feishu_bitable_create_record`**
+    已完成""金额写错了改成 12000""把这几行都标记成已归档"时，**别新增一行**
     （那会多出一行重复数据），按三步改：
-    1. `feishu_bitable_list_fields(app_token, table_id)` 拿**真实列名**——飞书对不认识的列名**静默丢弃
+    1. `feishu_api` GET `.../tables/:table_id/fields` 拿**真实列名**——飞书对不认识的列名**静默丢弃
        还照样返回 code:0**，列名对不上就是"报成功但格子没变"（这是历史上真翻过的车）。
     2. `feishu_bitable_search_records(app_token, table_id, filter_json=...)` 按条件定位到那行，拿 `record_id`：
        `filter_json` 是 `{"conjunction":"and","conditions":[{"field_name":"姓名","operator":"is",
        "value":["张三"]}]}`，`conjunction` 是 `and`/`or`，`value` **一律是字符串数组**，可用的 operator 有
        `is`/`isNot`/`contains`/`doesNotContain`/`isEmpty`/`isNotEmpty`/`isGreater`/`isGreaterEqual`/
        `isLess`/`isLessEqual`（日期列不支持 isNot/contains/doesNotContain/isGreaterEqual/isLessEqual）。
-       这是官方推荐的拿 record_id 的方式，比 `list_records` 整表翻页靠谱；只想整表/整视图列出来才用
-       `list_records`。要看某一行现在的值用 `feishu_bitable_get_record(app_token, table_id, record_id)`。
+       这是官方推荐的拿 record_id 的方式，比整表翻页靠谱；只想整表/整视图列出来才用 `feishu_api` GET
+       `.../tables/:table_id/records`。要看某一行现在的值用 `feishu_api` GET
+       `.../tables/:table_id/records/:record_id`。
     3. 改一行用 `feishu_bitable_update_record(app_token, table_id, record_id, fields_json)`；一次改多行用
        `feishu_bitable_update_records(app_token, table_id, records_json)`，`records_json` 是
        `[{"record_id":"recA","fields":{"状态":"已完成"}},{"record_id":"recB","fields":{"金额":12000}}]`

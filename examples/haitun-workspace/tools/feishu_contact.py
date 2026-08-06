@@ -1,20 +1,27 @@
-"""Feishu/Lark contact (通讯录) tools — list department members.
+"""Feishu/Lark contact (通讯录) tools — read the org chart and administer it.
 
-Get the roster (user ids + names) for a department, or the whole organization
-from the root department "0". This gives the agent the ``user_id`` list needed to
-batch-query attendance and compute payroll.
+What is left here are the reads that do more than forward one request: a
+department's roster (``feishu_department_members``), someone by phone or email
+(``feishu_contact_find``), the org chart (``feishu_department_tree`` /
+``feishu_department_get``), and a user group's members
+(``feishu_user_group_members``).
 
-Also resolve a person's contact details (mobile / email / job title) by id, so an
-employee stuck on a blocker can be handed the right owner's way to reach them.
+Everything else in this domain — searching the org by name, creating/modifying
+users and departments, marking people as resigned, and managing user groups — is
+now an endpoint table rather than a tool: call ``feishu_api`` and read the
+``feishu-contact`` skill first. The irreversible ones (resign a user, delete a
+department or user group) are gated there by an explicit ``confirm`` phrase.
 
-Or search the whole org for a user by name (``feishu_contact_search``) when you
-don't already know which group or department they're in — this needs a
-user_access_token (authorize once via ``feishu_auth_start``).
+Those write endpoints only accept the app's own tenant token and need the
+``contact:contact`` scope (``contact:group`` for user groups) — authorizing as a
+user does not help. Their most common failure is not a bad parameter but the app's
+**通讯录权限范围** (set in the developer console) not covering the target.
 
 Requires the app's 通讯录权限范围 to cover the members you want to see, the
 ``contact:contact.base:readonly`` scope (plus ``contact:user.employee_id:readonly``
 for the ``user_id``/employee-id field). Reading ``mobile`` / ``email`` also needs
-``contact:user.phone:readonly`` / ``contact:user.email:readonly`` (empty otherwise).
+``contact:user.phone:readonly`` / ``contact:user.email:readonly`` (empty otherwise);
+looking someone up *by* phone/email needs ``contact:user.id:readonly``.
 Set ``PSI_FEISHU_APP_ID`` / ``PSI_FEISHU_APP_SECRET``.
 """
 
@@ -53,51 +60,155 @@ async def feishu_department_members(
     )
 
 
-async def feishu_user_get(
-    user_ids: str,
+async def feishu_contact_find(
+    mobiles: str = "",
+    emails: str = "",
+    include_resigned: bool = True,
     user_id_type: str = "open_id",
-    department_id_type: str = "open_department_id",
 ) -> str:
-    """Get colleagues' contact details (mobile, email, job title) by id, up to 50 at once.
+    """Find users by phone number or email — exact match, returns their open_id and name.
 
-    Use this to hand someone a way to reach the right person — e.g. after finding who
-    owns a blocked area, look up that owner's phone/email here so you can share it.
-    Returns per user ``{open_id, user_id, name, mobile, email, enterprise_email,
-    job_title, department_ids, leader_user_id}``. ``mobile``/``email`` come back empty
-    unless the app has the phone/email contact scopes and the 通讯录权限范围 covers them.
+    Use this when you have someone's contact details but not their id: a phone number
+    from a form, an email from a ticket. Searching by *name* (``GET
+    /open-apis/search/v1/user`` via ``feishu_api``) needs the user to have authorized;
+    this matches phone/email exactly and works with the bot's own token.
 
-    Args:
-        user_ids: Comma-separated ids (max 50), in the form given by user_id_type.
-        user_id_type: Id form of user_ids — open_id (default), union_id, or user_id.
-        department_id_type: Id form for returned department_ids — open_department_id (default) or department_id.
-    """
-    return _f.dumps_result(await _f.get_users_batch_impl(user_ids, user_id_type, department_id_type))
+    Returns ``users[]`` with ``{user_id, matched_by, matched_value, name, job_title,
+    department_ids, is_resigned, is_activated}``, plus ``not_found[]`` listing which
+    inputs matched nobody — so "we couldn't find them" is distinguishable from "we
+    didn't ask about them".
 
-
-async def feishu_contact_search(query: str, page_size: int = 20, page_token: str = "", user_key: str = "") -> str:
-    """Search the whole org for users by name — no group or department needed.
-
-    This is the way to resolve a person by name when you *don't* know where they
-    are. ``feishu_chat_find_member`` only searches a group you know the ``chat_id``
-    of, and ``feishu_department_members`` needs a department id; this matches any
-    user across the organization by a name keyword. Use it to turn a bare name into
-    an ``open_id`` before @-mentioning, direct-messaging, or looking up contact
-    details with ``feishu_user_get``.
-
-    Returns matches as ``{open_id, user_id, name, avatar, department_ids}`` plus a
-    ``count``, ``has_more`` and ``page_token`` for the next page. If several people
-    share the name, all are returned — pick the right ``open_id``.
-
-    Feishu only allows this search with a user_access_token (the bot's own token
-    can't call it), so the caller must have authorized once — an unauthorized call
-    returns ``need_auth`` (see ``feishu_auth_start`` / ``feishu_auth_complete``).
+    Three things make a lookup come back empty even though the person exists:
+    **enterprise emails are not supported** (only personal ones), non-mainland-China
+    phone numbers must carry a ``+`` country code, and the app's 通讯录权限范围 must
+    cover the user. Resigned employees are included by default here (Feishu's own
+    default omits them silently, which makes "resigned" look identical to "no such
+    person") — pass ``include_resigned=False`` to exclude them.
 
     Args:
-        query: Name (or name keyword) to search for across the organization.
-        page_size: Max users to return per page (1-200, default 20).
-        page_token: Pagination cursor from a previous call's ``page_token`` (optional).
-        user_key: The message sender's open_id (from ``<feishu_context>``), so the
-            search runs as that authorized user. Must match the ``user_key`` used
-            when authorizing. Empty uses the shared ``default`` slot.
+        mobiles: Phone numbers, comma-separated (max 50). Non-mainland numbers need a
+            leading ``+`` and country code, e.g. ``+819012345678``.
+        emails: Email addresses, comma-separated (max 50). Personal addresses only —
+            enterprise mailboxes are never matched by this API.
+        include_resigned: Also match employees who have left. Default True.
+        user_id_type: Id form to return — open_id (default), union_id, or user_id.
     """
-    return _f.dumps_result(await _f.search_users_impl(query, page_size, page_token, user_key))
+    return _f.dumps_result(await _f.find_users_by_contact_impl(mobiles, emails, include_resigned, user_id_type))
+
+
+async def feishu_department_tree(
+    department_id: str = "0",
+    department_id_type: str = "open_department_id",
+    user_id_type: str = "open_id",
+    max_depth: int = 2,
+    include_member_count: bool = True,
+) -> str:
+    """List the sub-departments under a department as a nested org chart.
+
+    Start from ``"0"`` (the organization root) to see the whole company structure, or
+    from a department id to see one branch. Each node carries ``{department_id, name,
+    parent_department_id, leader_user_id, primary_leader_ids, deputy_leader_ids,
+    member_count, primary_member_count, chat_id}`` and a ``children`` list.
+
+    ``member_count`` includes everyone in the sub-tree; ``primary_member_count`` counts
+    only people whose *primary* department is this one — both are returned because
+    "how many people are in this department" has two legitimate answers.
+
+    Use this to get the ``department_id`` that ``feishu_department_members`` and the
+    user/department write endpoints (``feishu_api``, see the ``feishu-contact`` skill)
+    need. For one department's full detail plus its path from the root, use
+    ``feishu_department_get``.
+
+    Depth is walked one level at a time and capped by ``max_depth``, so an org too
+    large to fetch at once comes back truncated (with ``truncated: true``) rather than
+    failing outright. An empty result with the bot's own token usually means the app's
+    通讯录权限范围 isn't set to 全部成员 — Feishu returns nothing rather than an error.
+
+    Args:
+        department_id: Where to start; "0" is the organization root (default).
+        department_id_type: Id form — open_department_id (default) or department_id.
+        user_id_type: Id form for leader ids — open_id (default), union_id, user_id.
+        max_depth: How many levels to expand, 1-10. 1 = direct children only. Default 2.
+        include_member_count: Include the member-count fields. Default True.
+    """
+    return _f.dumps_result(
+        await _f.department_tree_impl(department_id, department_id_type, user_id_type, max_depth, include_member_count)
+    )
+
+
+async def feishu_department_get(
+    department_id: str,
+    department_id_type: str = "open_department_id",
+    user_id_type: str = "open_id",
+    include_children: bool = True,
+    include_path: bool = True,
+    user_key: str = "",
+) -> str:
+    """Get one department's full detail — leaders, member counts, and where it sits.
+
+    Returns ``department`` (name, parent, ``leader_user_id``, ``primary_leader_ids`` /
+    ``deputy_leader_ids`` split out of Feishu's combined ``leaders`` array,
+    ``department_hrbps``, ``chat_id``, ``member_count``, ``primary_member_count``),
+    its direct ``children``, and ``ancestors`` plus a readable ``path_text`` like
+    ``"公司/研发中心/平台组"`` — the answer to "where in the org chart is this".
+
+    Use it to confirm you have the right department before a write, and to find the
+    person in charge (``primary_leader_ids``) when you need an approver or owner.
+    The root department ``"0"`` has no detail to fetch — list from it with
+    ``feishu_department_tree`` instead.
+
+    Args:
+        department_id: The department id (not "0"). Get one from ``feishu_department_tree``.
+        department_id_type: Id form — open_department_id (default) or department_id.
+        user_id_type: Id form for leader/HRBP ids — open_id (default), union_id, user_id.
+        include_children: Also list direct sub-departments. Default True.
+        include_path: Also resolve the path from the root (ancestors + path_text). Default True.
+        user_key: The message sender's open_id, so a department the bot cannot see can
+            still be read under that user's own visibility. Optional.
+    """
+    return _f.dumps_result(
+        await _f.department_get_impl(
+            department_id, department_id_type, user_id_type, include_children, include_path, user_key
+        )
+    )
+
+
+async def feishu_user_group_members(
+    group_id: str,
+    action: str = "list",
+    user_ids: str = "",
+    member_id_type: str = "open_id",
+    member_type: str = "user",
+    page_size: int = 50,
+    page_token: str = "",
+) -> str:
+    """List, add, or remove the members of a user group.
+
+    ``action="list"`` returns the roster. Feishu returns **one member category per
+    call** — pass ``member_type="department"`` to see department members, which are
+    reported separately from users rather than mixed in.
+
+    ``action="add"`` / ``"remove"`` take a comma-separated ``user_ids``. Feishu's API
+    only accepts one member at a time, so these loop and report each person's outcome:
+    ``succeeded[]`` plus ``failed[]`` with a per-person reason, and ``partial: true``
+    when some worked. Adding someone already in the group is reported as 42005 rather
+    than treated as an error worth stopping for; resigned employees cannot be added
+    (42006). Only ``member_type="user"`` can be added or removed — Feishu does not yet
+    support department members here.
+
+    The most common failure is a mismatch: ``member_id_type`` must describe the ids you
+    actually pass (41072 means it doesn't). Needs the ``contact:group`` scope
+    (``contact:group:readonly`` to list).
+
+    Args:
+        group_id: The user group id, from ``GET /open-apis/contact/v3/group/simplelist``.
+        action: list (default) | add | remove.
+        user_ids: Comma-separated member ids for add/remove, in the form given by member_id_type.
+        member_id_type: Id form of user_ids — open_id (default), union_id, or user_id.
+        member_type: user (default) or department. Only "user" works for add/remove.
+        page_size: Members per page for list, 1-100. Default 50.
+        page_token: Pagination cursor from a previous list call.
+    """
+    return _f.dumps_result(
+        await _f.user_group_members_impl(group_id, action, user_ids, member_id_type, member_type, page_size, page_token)
+    )

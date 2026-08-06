@@ -17,6 +17,7 @@ import { NEW_TASK_PRESETS } from "./demo-fixtures";
 import { OVERVIEW_LABEL, type Task, type TaskTemplate } from "./model";
 import { AgentMark, BrandLogo } from "./primitives";
 import { filesFromClipboard } from "../services/clipboardFiles";
+import { useComposerFileDrop } from "../services/composerFileDrop";
 import { onComposerEnterKey } from "../services/composerKeys";
 
 export function NewTaskWorkspace({
@@ -28,6 +29,8 @@ export function NewTaskWorkspace({
   onOpenTemplates,
   onCreate,
   onViewTask,
+  showTemplatesEntry = true,
+  backLabel,
 }: {
   draft: string;
   category: string;
@@ -38,10 +41,18 @@ export function NewTaskWorkspace({
   /** Same path as overview chat: text + File[] go into the first Session chat turn. */
   onCreate: (title: string, category: string, files?: File[]) => Task | Promise<Task>;
   onViewTask: (task: Task) => void;
+  /** When false, hide「从任务模板开始」(overview/templates temporarily off). */
+  showTemplatesEntry?: boolean;
+  /** Override back-button label (default: 返回任务总览). */
+  backLabel?: string;
 }) {
   const [typing, setTyping] = useState(false);
   const [attachments, setAttachments] = useState<File[]>([]);
   const attachmentRef = useRef<HTMLInputElement | null>(null);
+  const { isFileDragOver, dropProps } = useComposerFileDrop({
+    enabled: !typing,
+    onFiles: (files) => setAttachments((current) => [...current, ...files]),
+  });
 
   const canSend = Boolean(draft.trim() || attachments.length);
 
@@ -67,7 +78,7 @@ export function NewTaskWorkspace({
   };
 
   return (
-    <section className="new-task-workspace" aria-label="新建任务对话">
+    <section className="new-task-workspace" aria-label="新建任务/聊天对话">
       <div className="new-task-ambient one" />
       <div className="new-task-ambient two" />
 
@@ -78,12 +89,15 @@ export function NewTaskWorkspace({
         </div>
 
         <div className="new-task-greeting">
-          <span className="eyebrow">新建任务</span>
+          <span className="eyebrow">新建任务/聊天</span>
           <h1>有什么可以帮您？</h1>
           <p>描述希望得到的结果、截止时间，以及手头已有的材料。发送后会进入任务分屏继续对话。</p>
         </div>
 
-        <div className="new-task-compose-block">
+        <div
+          className={`new-task-compose-block${isFileDragOver ? " is-file-drag-over" : ""}`}
+          {...dropProps}
+        >
           {!typing && (
             <div className="new-task-presets">
               {NEW_TASK_PRESETS.map((preset) => {
@@ -188,8 +202,12 @@ export function NewTaskWorkspace({
         </div>
 
         <div className="new-task-secondary-actions">
-          <button type="button" onClick={onOpenTemplates} disabled={typing}><SquareStack size={15} /> 从任务模板开始</button>
-          <button type="button" onClick={onBack} disabled={typing}><ArrowLeft size={15} /> 返回{OVERVIEW_LABEL}</button>
+          {showTemplatesEntry ? (
+            <button type="button" onClick={onOpenTemplates} disabled={typing}><SquareStack size={15} /> 从任务模板开始</button>
+          ) : <span />}
+          <button type="button" onClick={onBack} disabled={typing}>
+            <ArrowLeft size={15} /> {backLabel ?? `返回${OVERVIEW_LABEL}`}
+          </button>
         </div>
       </div>
     </section>

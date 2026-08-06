@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Task } from '../haitun-agent/model'
 import {
+  extractSendPaths,
   historyToChat,
   historyToDeliverables,
   withCompletedTurn,
@@ -79,7 +80,7 @@ describe('historyToChat', () => {
     ])
   })
 
-  it('coalesces consecutive assistant rows from tool rounds into one bubble', () => {
+  it('coalesces consecutive assistant rows keeping only the last prose', () => {
     expect(
       historyToChat([
         { role: 'user', text: '做剧本杀包' },
@@ -101,12 +102,7 @@ describe('historyToChat', () => {
       { role: 'user', text: '做剧本杀包' },
       {
         role: 'agent',
-        text: [
-          'Step 2 ✅ 开场与规则说明',
-          'Step 3 ✅ 角色卡对照表',
-          'Step 4 ✅ 生成 .docx 并交付',
-          'write_word 的工具结果和实际写入不一致，我直接用 Python 生成文件。',
-        ].join('\n\n'),
+        text: 'write_word 的工具结果和实际写入不一致，我直接用 Python 生成文件。',
         files: [{ name: 'pack.docx', data: '', path: '/ws/pack.docx' }],
       },
       { role: 'user', text: '再改一版' },
@@ -131,7 +127,7 @@ describe('historyToChat', () => {
     ).toEqual([
       {
         role: 'agent',
-        text: 'Step 1\n\n最终回复',
+        text: '最终回复',
         reasoning: '先读文件\n再总结',
       },
     ])
@@ -173,6 +169,20 @@ describe('historyToDeliverables', () => {
       names: ['a.md', 'b.html'],
       paths: { 'a.md': '/other/a.md', 'b.html': '/ws/b.html' },
     })
+  })
+})
+
+describe('extractSendPaths', () => {
+  it('parses plain and space-padded SEND markers', () => {
+    expect(
+      extractSendPaths('ok\n[SEND:/ws/a.md]\n[ SEND:C:/docs/b.html ]'),
+    ).toEqual(['/ws/a.md', 'C:/docs/b.html'])
+  })
+
+  it('parses lowercase SEND markers', () => {
+    expect(
+      extractSendPaths('ok\n[Send:/ws/a.md]\n[send: C:/docs/b.html ]'),
+    ).toEqual(['/ws/a.md', 'C:/docs/b.html'])
   })
 })
 

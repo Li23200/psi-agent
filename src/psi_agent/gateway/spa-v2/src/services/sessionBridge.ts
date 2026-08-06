@@ -27,6 +27,25 @@ export function basenameOf(path: string): string {
   return n[n.length - 1] || path
 }
 
+/** Extract ``[SEND:path]`` values in order (parity with backend ``extract_send_paths``). */
+export function extractSendPaths(text: string): string[] {
+  const out: string[] = []
+  const re = /\[\s*SEND\s*:\s*([^\]]*?)\s*\]/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text ?? '')) !== null) {
+    const p = m[1]?.trim()
+    if (p) out.push(p)
+  }
+  return out
+}
+
+/** Map file basenames to their absolute paths for preview reload. */
+export function pathsByName(paths: string[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const p of paths) out[basenameOf(p)] = p
+  return out
+}
+
 /**
  * Project Gateway `/history` rows into workspace chat bubbles.
  * Server already whitelists by ``kind``; still strip transfer markers and drop empties
@@ -34,10 +53,10 @@ export function basenameOf(path: string): string {
  * Assistant ``sends`` become file stubs (name + path, empty data) so chat chips
  * survive refresh and can lazy-load via ``GET /workspace/file``.
  *
- * **刻意为之**：连续 `assistant` 行合并成一个 agent 气泡（文案 `\n\n` 拼接、files 去重合并）。
+ * **刻意为之**：连续 `assistant` 行合并成一个 agent 气泡（files 去重合并）。
  * Session 在每轮 `tool_calls` 都会把带正文的 assistant 落盘，todo 多步时 JSONL 常有
- * 「Step N ✅ …」+ 短计划各占一行；流式 UI 经 `appendStreamingAgent` 累进同一气泡，
- * 若不合并，刷新后会拆成多个气泡并各挂一套操作栏。
+ * 「Step N ✅ …」+ 短计划各占一行；流式 UI 累进临时气泡，结算只留最后一段。
+ * 刷新合并时同样**只保留最后一段**正文，前面的步骤叙述丢弃（不对齐进工具区）。
  */
 export function historyToChat(messages: HistoryMessage[]): ChatMessage[] {
   const out: ChatMessage[] = []
@@ -58,15 +77,16 @@ export function historyToChat(messages: HistoryMessage[]): ChatMessage[] {
     const tools = role === 'agent' ? toolSummariesFromHistory(m.tools) : []
     const last = out[out.length - 1]
     if (role === 'agent' && last?.role === 'agent') {
-      const mergedText = [last.text, text].filter((t) => t.trim()).join('\n\n')
       const mergedFiles = mergeChatFiles(last.files, files)
       const mergedReasoning = [last.reasoning, reasoning]
         .filter((r): r is string => typeof r === 'string' && !!r.trim())
         .join('\n')
       const mergedTools = mergeToolLines(last.tools, tools)
+      const { interimText: _dropInterim, ...rest } = last
       out[out.length - 1] = {
-        ...last,
-        text: mergedText,
+        ...rest,
+        // Only the last tool-round prose remains as the bubble body.
+        text,
         ...(mergedFiles.length ? { files: mergedFiles } : {}),
         ...(mergedReasoning ? { reasoning: mergedReasoning } : {}),
         ...(mergedTools.length ? { tools: mergedTools } : {}),

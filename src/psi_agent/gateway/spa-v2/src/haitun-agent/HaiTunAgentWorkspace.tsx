@@ -44,6 +44,11 @@ import {
   signalLabel,
   type TaskSignalKind,
 } from "./taskSignals";
+import {
+  SHOW_OVERVIEW_AND_TEMPLATES,
+  cardIndexForTask,
+  taskAtCardIndex,
+} from "./uiSurface";
 
 import {
   INITIAL_TEMPLATES,
@@ -80,8 +85,17 @@ import {
 } from "../services/bootstrapAi";
 import { chatFileToFile, filesToChatFiles } from "../services/chatFiles";
 import { filesFromClipboard } from "../services/clipboardFiles";
+import { useComposerFileDrop } from "../services/composerFileDrop";
 import { onComposerEnterKey } from "../services/composerKeys";
 import { streamSessionChat } from "../services/chatStream";
+import {
+  appendContentSegment,
+  contentSegmentsStart,
+  sealContentBeforeTools,
+  settleContentSegments,
+  streamSegmentBodies,
+  type ContentSegments,
+} from "../services/contentSegments";
 import { applyProgressEvent, progressLogStart, type ProgressLog } from "../services/turnProgress";
 import {
   historyToChat,
@@ -95,6 +109,11 @@ import {
 } from "../services/sessionBridge";
 import { normalizeFailedTurns } from "../services/messageTurn";
 import {
+  addPendingDeliveries,
+  clearPendingDeliveries,
+  pendingDeliveriesFor,
+} from "../services/pendingDeliveries";
+import {
   normalizeWorkspacePath,
   sessionBackendId,
   sessionMatchesWorkspace,
@@ -102,7 +121,7 @@ import {
 
 const OVERVIEW_WELCOME: ChatMessage = {
   role: "agent",
-  text: "工作区已连接 Gateway。新建任务或从侧栏打开历史 Session，即可与 Agent 真实对话。",
+  text: "工作区已连接 Gateway。新建任务/聊天或从侧栏打开历史 Session，即可与 Agent 真实对话。",
 };
 
 import {
@@ -121,6 +140,7 @@ import {
 
 import { TaskFocusDetails } from "./task-focus-details";
 import { FocusChatThread } from "./focus-chat-thread";
+import { ExecutionStepsPanel } from "./execution-steps-panel";
 
 import { ArtifactDrawer } from "./workspace-overlays";
 
@@ -166,7 +186,7 @@ export default function HaiTunAgentWorkspace({
   const [chatDrafts, setChatDrafts] = useState<Record<string, string>>({});
   const [chatAttachments, setChatAttachments] = useState<Record<string, File[]>>({});
   const [chatExpanded, setChatExpanded] = useState(false);
-  const [contextPanelCollapsed, setContextPanelCollapsed] = useState(false);
+  const [contextPanelCollapsed, setContextPanelCollapsed] = useState(true);
   const [typingCard, setTypingCard] = useState<string | null>(null);
   /** Growing process lines (规划下一步 + sealed steps); cleared when turn ends. */
   const [turnProgressLog, setTurnProgressLog] = useState<ProgressLog | null>(null);
@@ -195,6 +215,8 @@ export default function HaiTunAgentWorkspace({
   const turnReasoningRef = useRef("");
   /** Sealed tool one-liners for the current turn (mirrors progress log ``lines``). */
   const turnToolsRef = useRef<string[]>([]);
+  /** Content segments across tool rounds — interim bubble + last segment as final. */
+  const turnContentSegRef = useRef<ContentSegments>(contentSegmentsStart());
   /** After Stop, block submit briefly — Stop↔Send swap under the same click would re-send the restored draft. */
   const suppressSubmitUntilRef = useRef(0);
   const historyLoadedRef = useRef<Set<string>>(new Set(["overview"]));
@@ -209,10 +231,15 @@ export default function HaiTunAgentWorkspace({
   const segmentDetailCacheRef = useRef<Record<string, TodoSegmentDetail>>({});
   const workspaceNorm = normalizeWorkspacePath(workspace);
 
-  const cards = useMemo(() => [{ id: "overview", title: OVERVIEW_LABEL }, ...tasks.map((task) => ({ id: task.id, title: task.shortTitle }))], [tasks]);
-  const currentTask = currentIndex === 0 ? null : tasks[currentIndex - 1];
+  const cards = useMemo(() => {
+    const taskCards = tasks.map((task) => ({ id: task.id, title: task.shortTitle }));
+    return SHOW_OVERVIEW_AND_TEMPLATES
+      ? [{ id: "overview", title: OVERVIEW_LABEL }, ...taskCards]
+      : taskCards;
+  }, [tasks]);
+  const currentTask = taskAtCardIndex(tasks, currentIndex);
   const currentCard = cards[currentIndex] ?? cards[0];
-  const currentChatDraft = chatDrafts[currentCard.id] ?? "";
+  const currentChatDraft = currentCard ? (chatDrafts[currentCard.id] ?? "") : "";
   const pendingTasks = filterTasksBySignal(tasks, "pending");
   const deliveryTasks = filterTasksBySignal(tasks, "deliveries");
   const workingTasks = filterTasksBySignal(tasks, "working");
@@ -220,7 +247,7 @@ export default function HaiTunAgentWorkspace({
   const taskSearchResults = normalizedSearch
     ? tasks.filter((task) => `${task.title}${task.shortTitle}${task.category}${task.summary}${task.statusLabel}${task.deliverables.join(" ")}`.toLocaleLowerCase("zh-CN").includes(normalizedSearch)).slice(0, 4)
     : [];
-  const templateSearchResults = normalizedSearch
+  const templateSearchResults = SHOW_OVERVIEW_AND_TEMPLATES && normalizedSearch
     ? templates.filter((template) => `${template.title}${template.category}${template.description}${template.starterPrompt}${template.deliverables.join(" ")}`.toLocaleLowerCase("zh-CN").includes(normalizedSearch)).slice(0, 4)
     : [];
 
@@ -351,6 +378,10 @@ export default function HaiTunAgentWorkspace({
         current.map((task) => {
           if (task.id !== taskId) return task;
           let next = names.length ? withHistoricalDeliverables(task, names, paths) : task;
+          if (names.length) {
+            const pending = pendingDeliveriesFor(task.id).filter((name) => names.includes(name));
+            if (pending.length) next = { ...next, newDeliverables: pending, deliveryState: "ready" };
+          }
           if (chat.length) {
             const lastAgent = [...chat].reverse().find((m) => m.role === "agent" && !m.failed);
             const lastUser = [...chat].reverse().find((m) => m.role === "user" && !m.failed);
@@ -393,6 +424,27 @@ export default function HaiTunAgentWorkspace({
     }
   }, [refreshTodos, refreshTodoSegments, refreshTaskSummary, showToast]);
 
+  /** Re-read the authoritative /history after a turn so sends always surface. */
+  const refreshHistory = useCallback(async (taskId: string) => {
+    if (taskId === "overview") return;
+    try {
+      const hist = await fetchHistory(taskId);
+      const { names, paths } = historyToDeliverables(hist);
+      setTasks((current) =>
+        current.map((task) => {
+          if (task.id !== taskId || !names.length) return task;
+          let next = withHistoricalDeliverables(task, names, paths);
+          const pending = pendingDeliveriesFor(taskId).filter((name) => names.includes(name));
+          if (pending.length) next = { ...next, newDeliverables: pending, deliveryState: "ready" };
+          return next;
+        }),
+      );
+      historyLoadedRef.current.add(taskId);
+    } catch {
+      // 保留现有状态；下次打开卡片时 ensureHistory 仍会重试
+    }
+  }, []);
+
   // While Agent runs, poll todos so middle step updates mid-turn (tool writes file).
   // Pass streaming=true so 「产出与确认」 stays working until the turn ends.
   useEffect(() => {
@@ -407,12 +459,13 @@ export default function HaiTunAgentWorkspace({
   }, [typingCard, refreshTodos, refreshTodoSegments]);
 
   const openArtifact = useCallback((task: Task, fileName?: string, listMode?: "new" | "history") => {
+    void ensureHistory(task.id);
     const mode = listMode
       ?? (fileName ? "history" : (task.newDeliverables.length ? "new" : "history"));
     setArtifactListMode(mode);
     setArtifactInitialFile(fileName);
     setArtifactTask(task);
-  }, []);
+  }, [ensureHistory]);
 
   const closeArtifact = useCallback(() => {
     setArtifactTask(null);
@@ -443,11 +496,13 @@ export default function HaiTunAgentWorkspace({
         if (cancelled) return;
         setAiId(preferred?.id ?? null);
         setOpenModelsOnce(openModels);
-        const mapped = inWs.map((s) =>
-          sessionToTask(s, titles[s.id] || "新任务", {
+        const mapped = inWs.map((s) => {
+          const pending = pendingDeliveriesFor(s.id)
+          return sessionToTask(s, titles[s.id] || "新任务", {
             ...(summaries[s.id] ? { summary: summaries[s.id] } : {}),
-          }),
-        );
+            ...(pending.length ? { newDeliverables: pending, deliveryState: "ready" } : {}),
+          })
+        });
         setTasks(mapped);
         historyLoadedRef.current = new Set(["overview"]);
         setMessages({ overview: [OVERVIEW_WELCOME] });
@@ -483,7 +538,6 @@ export default function HaiTunAgentWorkspace({
 
   const collapseChat = useCallback(() => {
     setChatExpanded(false);
-    setContextPanelCollapsed(false);
     activeChatInputRef.current?.blur();
   }, []);
 
@@ -517,7 +571,7 @@ export default function HaiTunAgentWorkspace({
   const selectTask = (task: Task) => {
     const index = tasks.findIndex((item) => item.id === task.id);
     if (index < 0) return;
-    const next = index + 1;
+    const next = cardIndexForTask(index);
     setMainView("workspace");
     setSidebarOpen(false);
     setSearchOpen(false);
@@ -533,7 +587,6 @@ export default function HaiTunAgentWorkspace({
       setDragX(0);
     }
     void ensureHistory(task.id);
-    setContextPanelCollapsed(false);
 
     if (chatExpanded) {
       // Already in focus: light content fade instead of swipe theater.
@@ -578,8 +631,19 @@ export default function HaiTunAgentWorkspace({
     setMainView("workspace");
     setSidebarPanel(null);
     setSidebarOpen(false);
+    if (!SHOW_OVERVIEW_AND_TEMPLATES) {
+      // No overview card — land on first task when any exist.
+      if (tasks.length > 0) goTo(0);
+      return;
+    }
     goTo(0);
-  }, [goTo]);
+  }, [goTo, tasks.length]);
+
+  // Keep card index in range after hide-overview or task deletes.
+  useEffect(() => {
+    if (cards.length === 0) return;
+    if (currentIndex >= cards.length) setCurrentIndex(cards.length - 1);
+  }, [cards.length, currentIndex]);
 
   const deleteTask = useCallback(async (task: Task) => {
     const ok = window.confirm(`确认删除任务「${task.title}」？\n删除后 Session 与对话历史将无法恢复。`);
@@ -602,6 +666,7 @@ export default function HaiTunAgentWorkspace({
       }
     }
 
+    clearPendingDeliveries(task.id);
     historyLoadedRef.current.delete(task.id);
     setTasks((current) => current.filter((item) => item.id !== task.id));
     setMessages((current) => {
@@ -622,10 +687,13 @@ export default function HaiTunAgentWorkspace({
     if (artifactTask?.id === task.id) closeArtifact();
 
     const deletedIndex = tasks.findIndex((item) => item.id === task.id);
-    if (deletedIndex >= 0 && currentIndex === deletedIndex + 1) {
-      goHome();
-    } else if (deletedIndex >= 0 && currentIndex > deletedIndex + 1) {
-      setCurrentIndex((i) => Math.max(0, i - 1));
+    if (deletedIndex >= 0) {
+      const deletedCard = cardIndexForTask(deletedIndex);
+      if (currentIndex === deletedCard) {
+        goHome();
+      } else if (currentIndex > deletedCard) {
+        setCurrentIndex((i) => Math.max(0, i - 1));
+      }
     }
 
     showToast(`已删除任务「${task.shortTitle}」`);
@@ -643,6 +711,7 @@ export default function HaiTunAgentWorkspace({
   }, [collapseChat]);
 
   const openTemplates = useCallback(() => {
+    if (!SHOW_OVERVIEW_AND_TEMPLATES) return;
     collapseChat();
     setTemplateSearchSeed("");
     setMainView("templates");
@@ -650,15 +719,23 @@ export default function HaiTunAgentWorkspace({
     setSidebarOpen(false);
   }, [collapseChat]);
 
-  const appendStreamingAgent = (cardId: string, delta: string) => {
+  const applyStreamBodies = (cardId: string, seg: ContentSegments) => {
+    const { interimText, text } = streamSegmentBodies(seg);
     setMessages((current) => {
       const list = [...(current[cardId] ?? [])];
       const last = list[list.length - 1];
       if (last?.role === "agent") {
-        // Preserve files: blob may arrive before more text deltas.
-        list[list.length - 1] = { ...last, text: last.text + delta };
+        list[list.length - 1] = {
+          ...last,
+          text,
+          ...(interimText.trim() ? { interimText } : { interimText: undefined }),
+        };
       } else {
-        list.push({ role: "agent", text: delta });
+        list.push({
+          role: "agent",
+          text,
+          ...(interimText.trim() ? { interimText } : {}),
+        });
       }
       return { ...current, [cardId]: list };
     });
@@ -761,6 +838,7 @@ export default function HaiTunAgentWorkspace({
     setTurnProgressLog(progressLogStart());
     turnReasoningRef.current = "";
     turnToolsRef.current = [];
+    turnContentSegRef.current = contentSegmentsStart();
     setTodoSegmentSelection((current) => ({ ...current, [cardId]: "live" }));
     const userVisible = titleSource ?? (text.trim() || "附件");
     let turnOk = false;
@@ -783,13 +861,15 @@ export default function HaiTunAgentWorkspace({
         {
           onText: (delta) => {
             if (!live()) return;
+            turnContentSegRef.current = appendContentSegment(turnContentSegRef.current, delta);
             setTurnProgressLog((prev) =>
               applyProgressEvent(prev ?? progressLogStart(), "content", ""),
             );
-            appendStreamingAgent(cardId, delta);
+            applyStreamBodies(cardId, turnContentSegRef.current);
           },
           onBlob: (name, data, path) => {
             if (!live()) return;
+            addPendingDeliveries(cardId, [name]);
             setTasks((current) =>
               current.map((task) =>
                 (task.id === cardId
@@ -814,6 +894,10 @@ export default function HaiTunAgentWorkspace({
           },
           onReasoning: (delta, kind) => {
             if (!live()) return;
+            if (kind === "tool_call") {
+              turnContentSegRef.current = sealContentBeforeTools(turnContentSegRef.current);
+              applyStreamBodies(cardId, turnContentSegRef.current);
+            }
             if (delta) turnReasoningRef.current += delta;
             setTurnProgressLog((prev) => {
               const next = applyProgressEvent(prev ?? progressLogStart(), kind, delta);
@@ -829,9 +913,9 @@ export default function HaiTunAgentWorkspace({
         return;
       }
       turnOk = true;
-      assistantFull = full.trim();
+      assistantFull = settleContentSegments(turnContentSegRef.current).finalText || full.trim();
       const hasBlob = blobs.length > 0;
-      if (!full.trim() && !hasBlob) {
+      if (!full.trim() && !hasBlob && !assistantFull) {
         // No displayable reply — mark orphan user failed (same as history normalize).
         turnOk = false;
         setMessages((current) => {
@@ -909,14 +993,17 @@ export default function HaiTunAgentWorkspace({
       if (epoch === streamEpochRef.current) {
         const reasoningRaw = turnReasoningRef.current.trim();
         const tools = [...turnToolsRef.current];
-        // Keep thinking + tools when the agent bubble still exists (not Stop).
-        if ((reasoningRaw || tools.length) && !controller.signal.aborted) {
+        const { finalText } = settleContentSegments(turnContentSegRef.current);
+        // Settle: drop temporary step bubble; keep only the last segment as body.
+        if (!controller.signal.aborted) {
           setMessages((current) => {
             const list = [...(current[cardId] ?? [])];
             const last = list[list.length - 1];
             if (last?.role === "agent") {
               list[list.length - 1] = {
                 ...last,
+                text: finalText || last.text,
+                interimText: undefined,
                 ...(reasoningRaw ? { reasoning: reasoningRaw } : {}),
                 ...(tools.length ? { tools } : {}),
               };
@@ -932,7 +1019,11 @@ export default function HaiTunAgentWorkspace({
       void (async () => {
         const todosAfter = await refreshTodos(cardId, false);
         await refreshTodoSegments(cardId);
-        if (!turnOk || epoch !== streamEpochRef.current) return;
+        if (epoch !== streamEpochRef.current) return;
+        if (!turnOk) {
+          historyLoadedRef.current.delete(cardId);
+          return;
+        }
         setTasks((current) =>
           current.map((task) => (task.id === cardId ? withCompletedTurn(task) : task)),
         );
@@ -945,6 +1036,8 @@ export default function HaiTunAgentWorkspace({
             4200,
           );
         }
+        // 服务端已提交本轮 history；回读 sends，补齐历史交付物（含路径）
+        await refreshHistory(cardId);
       })();
     }
   };
@@ -968,7 +1061,7 @@ export default function HaiTunAgentWorkspace({
         overview: [
           ...(current.overview ?? []),
           { role: "user", text: userVisible },
-          { role: "agent", text: "请先新建任务或打开历史任务；总览卡片不直接调用模型。" },
+          { role: "agent", text: "请先新建任务/聊天或打开历史任务；总览卡片不直接调用模型。" },
         ],
       }));
       setChatDrafts((current) => ({ ...current, overview: "" }));
@@ -1078,6 +1171,14 @@ export default function HaiTunAgentWorkspace({
       [cardId]: [...(current[cardId] ?? []), ...next],
     }));
   };
+
+  const { isFileDragOver, dropProps: composerDropProps } = useComposerFileDrop({
+    enabled: Boolean(currentCard?.id),
+    onFiles: (files) => {
+      addChatAttachments(currentCard.id, files);
+      setChatExpanded(true);
+    },
+  });
 
   /** Paste any clipboard file (screenshot, copied file, …) ≡ paperclip attach. */
   const handleChatPaste = (cardId: string, event: React.ClipboardEvent<HTMLTextAreaElement>) => {
@@ -1197,7 +1298,6 @@ export default function HaiTunAgentWorkspace({
       }),
       category: category || "自由任务",
     };
-    historyLoadedRef.current.add(session.id);
     setTasks((current) => [...current, newTask]);
     const storedFiles = pendingFiles.length ? await filesToChatFiles(pendingFiles) : [];
     setMessages((current) => ({
@@ -1228,7 +1328,7 @@ export default function HaiTunAgentWorkspace({
 
     if (cardId === "overview") {
       // Overview has no Session — create a task and jump into its dialog.
-      const nextIndex = tasks.length + 1;
+      const nextIndex = cardIndexForTask(tasks.length);
       try {
         await createTask(clean, "自由任务");
         setMainView("workspace");
@@ -1250,7 +1350,9 @@ export default function HaiTunAgentWorkspace({
   const viewCreatedTask = (task: Task) => {
     // Prefer task id; fall back to "just appended" index (same as overview quick-create).
     const index = tasks.findIndex((item) => item.id === task.id);
-    const nextIndex = index >= 0 ? index + 1 : tasks.length + 1;
+    const nextIndex = index >= 0
+      ? cardIndexForTask(index)
+      : cardIndexForTask(tasks.length);
     setMainView("workspace");
     setSidebarOpen(false);
     setSearchOpen(false);
@@ -1262,6 +1364,10 @@ export default function HaiTunAgentWorkspace({
   };
 
   const useTemplate = (template: TaskTemplate) => {
+    if (!SHOW_OVERVIEW_AND_TEMPLATES) {
+      openNewTask(template.starterPrompt, template.category, "workspace");
+      return;
+    }
     openNewTask(template.starterPrompt, template.category, "templates");
   };
 
@@ -1284,6 +1390,7 @@ export default function HaiTunAgentWorkspace({
   };
 
   const saveArtifact = (task: Task) => {
+    clearPendingDeliveries(task.id);
     setTasks((current) => current.map((item) => item.id === task.id
       ? {
           ...item,
@@ -1344,7 +1451,19 @@ export default function HaiTunAgentWorkspace({
         return;
       }
       const target = event.target as HTMLElement;
-      if (["INPUT", "TEXTAREA"].includes(target.tagName)) return;
+      const inField = ["INPUT", "TEXTAREA"].includes(target.tagName);
+      // Task flip: ←/→ when not typing; Alt+←/→ also works inside the composer.
+      if (
+        mainView === "workspace"
+        && (event.key === "ArrowLeft" || event.key === "ArrowRight")
+        && (!inField || event.altKey)
+      ) {
+        event.preventDefault();
+        if (event.key === "ArrowLeft") goTo(currentIndex - 1);
+        else goTo(currentIndex + 1);
+        return;
+      }
+      if (inField) return;
       if (mainView !== "workspace") {
         if (event.key === "Escape") {
           if (mainView === "new-task") setMainView(newTaskReturnView);
@@ -1352,8 +1471,6 @@ export default function HaiTunAgentWorkspace({
         }
         return;
       }
-      if (event.key === "ArrowLeft") goTo(currentIndex - 1);
-      if (event.key === "ArrowRight") goTo(currentIndex + 1);
       if (event.key === "Escape") setSidebarOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
@@ -1373,7 +1490,7 @@ export default function HaiTunAgentWorkspace({
     : sidebarPanel === "working" ? workingTasks
     : tasks;
   const renderCardAt = (index: number, openChat?: () => void) => {
-    const task = index === 0 ? null : tasks[index - 1];
+    const task = taskAtCardIndex(tasks, index);
     return task
       ? <TaskCard task={task} onOpenArtifact={openArtifact} onDelete={deleteTask} onOpenChat={openChat} />
       : <OverviewCard tasks={tasks} onOpenChat={openChat} onOpenSignal={(kind) => openSignal(kind, { toggle: true })} />;
@@ -1381,11 +1498,21 @@ export default function HaiTunAgentWorkspace({
 
   const renderTaskUnit = (index: number, interactive: boolean, visualExpanded = false) => {
     const unitCard = cards[index] ?? cards[0];
-    const unitTask = index === 0 ? null : tasks[index - 1];
+    if (!unitCard) return null;
+    const unitTask = taskAtCardIndex(tasks, index);
     const focusTask = focusChecklistTask(unitTask);
     const unitMessages = messages[unitCard.id] ?? [];
     const unitDraft = chatDrafts[unitCard.id] ?? "";
     const expanded = interactive ? chatExpanded : visualExpanded;
+    const unitBusy = typingCard === unitCard.id;
+    const unitHasDelivery = !!unitTask && unitTask.newDeliverables.length > 0;
+    const openUnitChest = () => {
+      if (!unitHasDelivery || !unitTask) {
+        showToast("暂无新交付物");
+        return;
+      }
+      openArtifact(unitTask, undefined, "new");
+    };
 
     return (
       <div className={`card-chat-unit ${expanded ? "chat-expanded" : ""} ${expanded && contextPanelCollapsed ? "context-collapsed" : ""}`}>
@@ -1462,48 +1589,140 @@ export default function HaiTunAgentWorkspace({
         </div>
 
         <section
-          className="context-chat"
+          className={`context-chat${interactive && isFileDragOver ? " is-file-drag-over" : ""}`}
           aria-label={`关于${unitCard.title}的对话`}
+          {...(interactive ? composerDropProps : {})}
           onClick={(event) => {
             if (!interactive || expanded) return;
             if ((event.target as HTMLElement).closest("[data-attach-control], button, a")) return;
             setChatExpanded(true);
           }}
         >
+          {expanded && interactive && (
+            <>
+              <button
+                type="button"
+                className="card-arrow previous chat-pane-arrow"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  goTo(index - 1);
+                }}
+                disabled={index === 0}
+                aria-label="上一任务"
+              >
+                <ArrowLeft size={20} />
+              </button>
+              <button
+                type="button"
+                className="card-arrow next chat-pane-arrow"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  goTo(index + 1);
+                }}
+                disabled={index === cards.length - 1}
+                aria-label="下一任务"
+              >
+                <ArrowRight size={20} />
+              </button>
+            </>
+          )}
           <div className="chat-context-row">
             <div>
               {expanded && interactive && contextPanelCollapsed && (
-                <>
-                  <button
-                    type="button"
-                    className="context-panel-toggle context-panel-toggle-in-chat"
-                    onClick={() => setContextPanelCollapsed(false)}
-                    aria-label="展开任务上下文栏"
-                    aria-expanded={false}
-                  >
-                    <PanelLeftOpen size={15} />
-                  </button>
-                  <button
-                    type="button"
-                    className="context-panel-new-task context-panel-new-task-in-chat"
-                    onClick={() => openNewTask()}
-                    aria-label="新建任务"
-                  >
-                    <Plus size={15} />
-                    <span>新建任务</span>
-                  </button>
-                </>
+                <button
+                  type="button"
+                  className="context-panel-toggle context-panel-toggle-in-chat"
+                  onClick={() => setContextPanelCollapsed(false)}
+                  aria-label="展开任务上下文栏"
+                  aria-expanded={false}
+                >
+                  <PanelLeftOpen size={15} />
+                </button>
               )}
               <AgentMark /><span>{expanded ? "任务工作区" : "关于"} <strong>{unitCard.title}</strong>{!expanded && " 的对话"}</span>
             </div>
+            {expanded && interactive && cards.length > 0 && (
+              <div className="focus-card-pager" role="navigation" aria-label="任务翻页">
+                <button
+                  type="button"
+                  className="focus-card-pager-btn"
+                  onClick={() => goTo(index - 1)}
+                  disabled={index === 0}
+                  aria-label="上一任务"
+                >
+                  <ArrowLeft size={14} />
+                </button>
+                <span className="focus-card-pager-label" aria-live="polite">
+                  {String(index + 1).padStart(2, "0")} / {String(cards.length).padStart(2, "0")}
+                </span>
+                <button
+                  type="button"
+                  className="focus-card-pager-btn"
+                  onClick={() => goTo(index + 1)}
+                  disabled={index === cards.length - 1}
+                  aria-label="下一任务"
+                >
+                  <ArrowRight size={14} />
+                </button>
+              </div>
+            )}
             <div className="quick-actions">
               {expanded && (
                 <>
+                  <span className="agent-status-tooltip-wrap">
+                    <button
+                      type="button"
+                      className={`chat-top-icon agent-status-icon ${unitBusy ? "busy" : ""}`}
+                      aria-label={unitBusy ? "Agent 正在思考执行任务" : "Agent 空闲"}
+                    >
+                      <svg
+                        width="15"
+                        height="15"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        className="agent-status-clock"
+                        aria-hidden="true"
+                      >
+                        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                        <path d="M3 3v5h5" />
+                        <path className="agent-status-clock-hand" d="M12 7v5l4 2" />
+                      </svg>
+                    </button>
+                    <span className="agent-status-tooltip" role="tooltip">
+                      {unitBusy ? "Agent 正在思考执行任务" : "Agent 空闲"}
+                    </span>
+                  </span>
+                  <span className="agent-status-tooltip-wrap">
+                    <button
+                      type="button"
+                      className={`chat-top-icon agent-status-icon ${unitBusy ? "busy" : ""}`}
+                      aria-label={unitBusy ? "Agent 正在思考执行任务" : "Agent 思考完成，任务空闲"}
+                    >
+                      <span className={`signal-orb ${unitBusy ? "red" : "green"}`} />
+                    </button>
+                    <span className="agent-status-tooltip" role="tooltip">
+                      {unitBusy ? "Agent 正在思考执行任务" : "Agent 思考完成，任务空闲"}
+                    </span>
+                  </span>
+                  <span className="agent-status-tooltip-wrap">
+                    <button
+                      type="button"
+                      className={`chat-top-icon agent-status-icon ${unitHasDelivery ? "has-delivery" : ""}`}
+                      onClick={openUnitChest}
+                      aria-label={unitHasDelivery ? "查看新交付物" : "暂无新交付物"}
+                    >
+                      <TreasureVisual state={unitHasDelivery ? "ready" : "none"} size="mini" />
+                    </button>
+                    <span className="agent-status-tooltip" role="tooltip">
+                      {unitHasDelivery ? "查看新交付物" : "暂无新交付物"}
+                    </span>
+                  </span>
                   <button type="button" className="chat-new-task" onClick={() => openNewTask()}>
-                    <Plus size={13} /> 新建任务
-                  </button>
-                  <button type="button" className="chat-collapse" onClick={collapseChat}>
-                    <ChevronDown size={13} /> 收起
+                    <Plus size={13} /> 新建任务/聊天
                   </button>
                 </>
               )}
@@ -1525,17 +1744,22 @@ export default function HaiTunAgentWorkspace({
           </div>
 
           {expanded && (
-            <FocusChatThread
-              messages={unitMessages}
-              typing={typingCard === unitCard.id}
-              title={unitCard.title}
-              progressLog={typingCard === unitCard.id ? turnProgressLog : null}
-              workspaceRoot={workspace}
-              loadingHistory={historyLoadingIds.has(unitCard.id)}
-              onFeedback={(index, kind) => setMessageFeedback(unitCard.id, index, kind)}
-              onRegenerate={(index) => void regenerateAgentMessage(unitCard.id, index)}
-              onRetry={(index) => void retryFailedMessage(unitCard.id, index)}
-            />
+            <>
+              <FocusChatThread
+                messages={unitMessages}
+                typing={typingCard === unitCard.id}
+                title={unitCard.title}
+                progressLog={typingCard === unitCard.id ? turnProgressLog : null}
+                workspaceRoot={workspace}
+                loadingHistory={historyLoadingIds.has(unitCard.id)}
+                onFeedback={(index, kind) => setMessageFeedback(unitCard.id, index, kind)}
+                onRegenerate={(index) => void regenerateAgentMessage(unitCard.id, index)}
+                onRetry={(index) => void retryFailedMessage(unitCard.id, index)}
+              />
+              {unitTask?.hasTodoTrack && (
+                <ExecutionStepsPanel steps={unitTask.steps} />
+              )}
+            </>
           )}
 
           {!expanded && <div className="latest-message">
@@ -1708,13 +1932,13 @@ export default function HaiTunAgentWorkspace({
           </div>
         </div>
 
-        <button type="button" className="brand-block" onClick={goHome} aria-label={`返回 HaiTun Agent ${OVERVIEW_LABEL}`}>
+        <button type="button" className="brand-block" onClick={goHome} aria-label="返回 HaiTun Agent">
           <BrandLogo />
           <div><strong>HaiTun</strong><span>Agent</span></div>
         </button>
 
         <button type="button" className="new-task-button" onClick={() => openNewTask()}>
-          <Plus size={18} /> 新建任务 <span>⌘ / Ctrl N</span>
+          <Plus size={18} /> 新建任务/聊天 <span>⌘ / Ctrl N</span>
         </button>
 
         <div className={`global-search ${searchOpen ? "open" : ""}`}>
@@ -1725,8 +1949,8 @@ export default function HaiTunAgentWorkspace({
               value={globalSearch}
               onFocus={() => setSearchOpen(true)}
               onChange={(event) => { setGlobalSearch(event.target.value); setSearchOpen(true); }}
-              placeholder="搜索任务或模板"
-              aria-label="全局搜索任务或模板"
+              placeholder={SHOW_OVERVIEW_AND_TEMPLATES ? "搜索任务或模板" : "搜索任务"}
+              aria-label={SHOW_OVERVIEW_AND_TEMPLATES ? "全局搜索任务或模板" : "全局搜索任务"}
             />
             <kbd>⌘ K</kbd>
           </label>
@@ -1743,8 +1967,8 @@ export default function HaiTunAgentWorkspace({
                   <History size={14} /><span><strong>{task.shortTitle}</strong><em>{task.category} · {task.statusLabel}</em></span><ChevronRight size={13} />
                 </button>
               ))}
-              {templateSearchResults.length > 0 && <span className="search-group-title">任务模板</span>}
-              {templateSearchResults.map((template) => (
+              {SHOW_OVERVIEW_AND_TEMPLATES && templateSearchResults.length > 0 && <span className="search-group-title">任务模板</span>}
+              {SHOW_OVERVIEW_AND_TEMPLATES && templateSearchResults.map((template) => (
                 <button type="button" key={template.id} onClick={() => {
                   setTemplateSearchSeed(template.title);
                   setMainView("templates");
@@ -1755,16 +1979,20 @@ export default function HaiTunAgentWorkspace({
                   <SquareStack size={14} /><span><strong>{template.title}</strong><em>{template.category} · 进入模板库查看</em></span><ChevronRight size={13} />
                 </button>
               ))}
-              {!taskSearchResults.length && !templateSearchResults.length && <div className="search-empty">没有找到匹配的任务或模板</div>}
+              {!taskSearchResults.length && !(SHOW_OVERVIEW_AND_TEMPLATES && templateSearchResults.length) && (
+                <div className="search-empty">{SHOW_OVERVIEW_AND_TEMPLATES ? "没有找到匹配的任务或模板" : "没有找到匹配的任务"}</div>
+              )}
             </div>
           )}
         </div>
 
         <nav className="primary-nav" aria-label="主导航">
-          <button type="button" className={mainView === "workspace" && currentIndex === 0 && !sidebarPanel ? "active" : ""} onClick={goHome}>
-            <Grid2X2 size={18} /> {OVERVIEW_LABEL} <ChevronRight size={15} />
-          </button>
-          <button type="button" className={mainView === "workspace" && (sidebarPanel === "history" || sidebarPanel === "pending" || sidebarPanel === "deliveries" || sidebarPanel === "working") ? "active" : ""} onClick={() => { setMainView("workspace"); setSidebarPanel((current) => current === "history" ? null : "history"); }}>
+          {SHOW_OVERVIEW_AND_TEMPLATES && (
+            <button type="button" className={mainView === "workspace" && currentIndex === 0 && !sidebarPanel ? "active" : ""} onClick={goHome}>
+              <Grid2X2 size={18} /> {OVERVIEW_LABEL} <ChevronRight size={15} />
+            </button>
+          )}
+          <button type="button" className={mainView === "workspace" && (sidebarPanel === "history" || sidebarPanel === "pending" || sidebarPanel === "deliveries" || sidebarPanel === "working" || (!SHOW_OVERVIEW_AND_TEMPLATES && !sidebarPanel)) ? "active" : ""} onClick={() => { setMainView("workspace"); setSidebarPanel((current) => current === "history" ? null : "history"); }}>
             <History size={18} /> 历史任务 {(sidebarPanel === "history" || sidebarPanel === "pending" || sidebarPanel === "deliveries" || sidebarPanel === "working") ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
           </button>
 
@@ -1803,9 +2031,11 @@ export default function HaiTunAgentWorkspace({
             </div>
           </div>
 
-          <button type="button" className={mainView === "templates" ? "active" : ""} onClick={openTemplates}>
-            <SquareStack size={18} /> 任务模板 <ChevronRight size={15} />
-          </button>
+          {SHOW_OVERVIEW_AND_TEMPLATES && (
+            <button type="button" className={mainView === "templates" ? "active" : ""} onClick={openTemplates}>
+              <SquareStack size={18} /> 任务模板 <ChevronRight size={15} />
+            </button>
+          )}
         </nav>
 
         <div className="sidebar-spacer" />
@@ -1855,21 +2085,50 @@ export default function HaiTunAgentWorkspace({
           <div className="stage-leading-actions">
             <button type="button" className="mobile-menu-button" onClick={() => setSidebarOpen(true)} aria-label="展开侧边栏" aria-controls="main-sidebar" aria-expanded={sidebarOpen}><Menu size={21} /></button>
             {mainView !== "workspace" && (
-              <button type="button" className="view-back-button" onClick={() => setMainView(mainView === "new-task" ? newTaskReturnView : "workspace")} aria-label="返回上一页">
-                <ArrowLeft size={17} /><span>{mainView === "new-task" && newTaskReturnView === "templates" ? "返回模板库" : `返回${OVERVIEW_LABEL}`}</span>
+              <button
+                type="button"
+                className="view-back-button"
+                onClick={() => {
+                  if (mainView === "new-task" && newTaskReturnView === "templates" && SHOW_OVERVIEW_AND_TEMPLATES) {
+                    setMainView("templates");
+                    return;
+                  }
+                  goHome();
+                }}
+                aria-label="返回上一页"
+              >
+                <ArrowLeft size={17} />
+                <span>
+                  {mainView === "new-task" && newTaskReturnView === "templates" && SHOW_OVERVIEW_AND_TEMPLATES
+                    ? "返回模板库"
+                    : SHOW_OVERVIEW_AND_TEMPLATES
+                      ? `返回${OVERVIEW_LABEL}`
+                      : "返回任务"}
+                </span>
               </button>
             )}
           </div>
           {!chatExpanded && (
             <div className="stage-actions">
               <button type="button" className="topbar-create-button" onClick={() => openNewTask()}>
-                <Plus size={15} /> 新建任务
+                <Plus size={15} /> 新建任务/聊天
               </button>
             </div>
           )}
         </header>
 
-        {mainView === "workspace" && (
+        {mainView === "workspace" && cards.length === 0 && (
+          <section className="workspace-empty" aria-label="暂无任务">
+            <AgentMark />
+            <h1>还没有任务</h1>
+            <p>新建任务/聊天后，会在这里进入分屏与 Agent 对话。</p>
+            <button type="button" className="topbar-create-button" onClick={() => openNewTask()}>
+              <Plus size={15} /> 新建任务/聊天
+            </button>
+          </section>
+        )}
+
+        {mainView === "workspace" && cards.length > 0 && (
           <section className={`card-stage ${chatExpanded ? "chat-focus-stage" : ""}`} aria-label="任务卡片">
             {!chatExpanded && (
               <button type="button" className="card-arrow previous" onClick={() => goTo(currentIndex - 1)} disabled={currentIndex === 0} aria-label="上一张卡片"><ArrowLeft size={20} /></button>
@@ -1907,10 +2166,12 @@ export default function HaiTunAgentWorkspace({
             onOpenTemplates={openTemplates}
             onCreate={createTask}
             onViewTask={viewCreatedTask}
+            showTemplatesEntry={SHOW_OVERVIEW_AND_TEMPLATES}
+            backLabel={SHOW_OVERVIEW_AND_TEMPLATES ? undefined : "返回任务"}
           />
         )}
 
-        {mainView === "templates" && (
+        {SHOW_OVERVIEW_AND_TEMPLATES && mainView === "templates" && (
           <TemplateLibrary key={templateSearchSeed || "all-templates"} templates={templates} initialSearch={templateSearchSeed} onBack={goHome} onUseTemplate={useTemplate} onCreateTemplate={createTemplate} />
         )}
       </main>

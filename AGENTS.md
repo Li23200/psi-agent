@@ -39,6 +39,16 @@ JSONL 格式零依赖，逐行追加读写简单。现路径为 AppData ``{appda
 **为什么 socket 文件不自动 unlink？**
 支持热换 Server。每个 `session.post()` 新建 TCP/Unix 连接，由 `UnixConnector` 按路径重新 connect。只要新的服务进程绑定到同一 socket 路径，客户端无需重启即可继续通信。auto-unlink 会破坏这个能力——socket 文件需要保留，由新进程手动接管。
 
+**Workflow 的形式语言与执行边界是什么？**
+Workflow 是由 `FusionFlow.g4` 定义的形式语言工作流系统。Haitun workspace
+的 `workflow` Skill 负责其声明式源码；parser/compiler 将源码编译为
+`fusion_flow.workflow_graph` 的 Step–Artifact 图，`fusion_flow.workflow_execution`
+生成并执行可检查的计划。workspace runner 在计划之上分派 Agent 和 Program，并用
+checkpoint + `run_flow_resume` 处理 Human 的跨回合等待。不含 Human Step 的工作流在
+首次 `run_flow` 调用内完成；Human 工作流只通过保存的请求继续。各类 Step 只能使用
+runner 注入的受限能力，外层 Session 仍须先收集完整的输入 Artifact。旧 Node/Fuclaw
+runtime 位于 `fusion-flow-legacy`，只处理显式 `.flow.ts` 兼容请求。
+
 ## 技术栈
 
 | 领域 | 技术 |
@@ -74,13 +84,20 @@ src/
     │   ├── __init__.py             # Session dataclass + run()，入口编排
     │   ├── server.py               # serve_session — aiohttp HTTP/SSE scaffold
     │   ├── channel_adapter.py       # ChannelAdapter — 纯无状态编解码（parse_request + write）
-    │   ├── agent.py                # SessionAgent — agent loop + 编排（委托给 4 个组件）
+    │   ├── agent.py                # SessionAgent — agent loop + 编排（委托给 4 个组件）；AgentRun = chunk 流 + 终态
     │   ├── tool_registry.py        # ToolRegistry — 工具集（加载/重载/查询）
     │   ├── conversation.py         # Conversation — 对话历史 + 持久化
     │   ├── system_prompt.py        # SystemPrompt — 系统 prompt 生命周期
     │   ├── schedule_registry.py    # ScheduleRegistry — 定时任务集
     │   ├── ai_client.py            # AiClient — AI 侧协议适配（HTTP/SSE → AiDelta）
-    │   ├── protocol.py             # Session 层类型
+    │   ├── protocol.py             # Session 层类型（含 `AgentRunResult` 运行终态）
+    ├── router/
+    │   ├── AGENTS.md               # Router 层设计与不变量
+    │   ├── entry.py                # Router 统一入口（routing / aggregation）
+    │   ├── client.py               # Socket-aware Chat Completions/SSE 客户端
+    │   ├── server.py               # 共享 HTTP/SSE 服务边界
+    │   ├── routing/                # Selector 单目标分流 + 工具链 sticky
+    │   └── aggregation/            # 全候选并发广播 + 专用 Aggregator 汇总
     ├── channel/
     │   ├── AGENTS.md                # Channel 层设计文档
     │   ├── __init__.py              # package marker
@@ -122,6 +139,7 @@ src/
 各层的详细设计文档见：
 - **AI 层**: `src/psi_agent/ai/AGENTS.md` — provider 配置、请求透传、错误处理、context compaction 触发
 - **Session 层**: `src/psi_agent/session/AGENTS.md` — workspace 启动、agent loop、tool 加载调用、schedule 机制、history 持久化、context compaction
+- **Router 层**: `src/psi_agent/router/AGENTS.md` — 单目标分流、广播聚合、SSE/隐私/取消不变量
 - **Channel 层**: `src/psi_agent/channel/AGENTS.md` — ChannelCore 公共部件、REPL/CLI/Telegram/Feishu 约定
 - **Gateway 层**: `src/psi_agent/gateway/AGENTS.md` — 生命周期管理、REST API、Web Console SPA、CI 打包
 
@@ -129,7 +147,8 @@ src/
 
 所有组件通过 **aiohttp** 以 **OpenAI Chat Completions HTTP/SSE** 格式通信。传输支持 Unix socket（仅 POSIX）、TCP、Windows Named Pipe（仅 Windows），由地址前缀自动检测（`psi_agent._sockets`）；平台与地址不匹配时抛 `ValueError` 快速失败，详见「关键注意事项」第 17 条：
 
-- **AI socket**: Session 作为客户端访问，`POST /chat/completions`
+- **AI socket**: Session 作为客户端访问，`POST /chat/completions`；可直连 AI，也可指向 Router 的 `session_socket`
+- **Router upstream socket**: Router 作为客户端访问 Selector/Aggregator 与候选 AI 的 `POST /chat/completions`
 - **Channel socket**: Session 作为服务端，`POST /chat/completions`
 
 SSE 流中的特殊字段：
@@ -211,7 +230,7 @@ SSE 流中的特殊字段：
 
 15. **Log 中两处同类操作应格式一致**：如 build prompt 和 rebuild prompt 都应该 log `({len(sp)} chars)`，否则排查时信息不对等。
 
-16. **消费 async generator 必须用 `aclosing()`**：`async for` 在提前退出或被 cancel 时不调用 generator 的 `aclose()`，导致 generator 内 `async with` 持有的资源（aiohttp 连接、文件句柄等）被遗弃给 GC。正确做法：`async with aclosing(gen) as g: async for chunk in g: ...`。对标 `ai/server.py` 的 `finally` + shielded `aclose()` 模式。参见 `agent.py`、`channel_adapter.py`、`schedule_registry.py`。
+16. **消费 async generator 必须用 `aclosing()`**：`async for` 在提前退出或被 cancel 时不调用 generator 的 `aclose()`，导致 generator 内 `async with` 持有的资源（aiohttp 连接、文件句柄等）被遗弃给 GC。正确做法：`async with aclosing(gen) as g: async for chunk in g: ...`。对标 `ai/server.py` 的 `finally` + shielded `aclose()` 模式。参见 `agent.py`、`channel_adapter.py`、`schedule_registry.py`。**推论：任何包装 generator 的自定义 async iterable 必须自己转发 `aclose()`**——否则包装一层就把这条约定连同上游连接一起漏掉（`AgentRun` 因此显式实现 `aclose()`，见 `session/AGENTS.md`「运行终态」）。
 
 17. **Windows 上裸路径地址直接拒绝（刻意为之，勿"修掉"）**：`_sockets.py` 的 `resolve_connector_and_endpoint` / `create_site` 在 `sys.platform == "win32"` 且地址落到 Unix 分支时**主动 `raise ValueError`**。因为 Windows 的 asyncio 没有 `create_unix_connection` / `create_unix_server`，若继续走 `UnixConnector` / `UnixSite`，aiohttp 会在 connect/listen 深处抛一个**不带任何上下文的 `NotImplementedError`**，极难定位（曾导致飞书 channel 每条消息崩、只显示 `generation interrupted`）。真实诱因：`channel feishu --session-socket \\.\pipe\...` 经 POSIX shell 传参时反斜杠被吞成单反斜杠 `\.\pipe\...`，匹配不上命名管道前缀而落到裸路径分支。**这是 fail-fast 前置校验，不是可删的多余检查**——非 Windows（POSIX）行为完全不变，Unix socket 照常工作。Windows/bash 下传管道地址需用四反斜杠 `'\\\\.\\pipe\\...'` 才能让程序收到两根反斜杠开头的 `\\.\pipe\...`。反方向同样门控：非 Windows 上传 `\\.\pipe\name` 也**主动 `raise ValueError`**，因为命名管道要 `ProactorEventLoop`，而 asyncio 在非 win32 平台根本不导出 `ProactorEventLoop`（`asyncio/__init__.py` 只在 `sys.platform == 'win32'` 时 `from .windows_events import *`），aiohttp 那句 `isinstance(loop, asyncio.ProactorEventLoop)` 门控自己会先抛裸 `AttributeError`。两个方向都是 fail-fast 前置校验。
 
@@ -301,6 +320,17 @@ uv run pytest -v                 # 全部测试
 uv run psi-agent --help          # CLI 帮助
 uv build                         # 构建
 ```
+
+## 多树协作与分支同步
+
+本仓常被同时 checkout 成多棵工作树并行施工（前端树 / workspace 树 / 参谋树）。约定如下：
+
+- **一棵树只改一个区**：前端树只碰 `src/psi_agent/gateway/spa-v2/`（及必要的 Gateway 壳 / spa v1）；workspace 树主要碰 `examples/haitun-workspace/`，以及必要的 Session / Gateway 服务端。越区改动优先换树，而不是在本树顺手改
+- **同 remote ≠ 同磁盘**：别人把分支合进 `main`，不会自动出现在你的工作树里；要用 `git fetch` 后显式合并
+- **接 `main` 时停在自己的 `feat/…` 上**：`git fetch origin` → 先 commit 或 stash 保护 WIP → `git merge origin/main`。冲突以各层 `AGENTS.md` 为准（保留三区 / AppData / ContextVar 约定后再叠自己的功能）
+- **禁止**擅自 `git reset --hard origin/main`——它会丢掉本树的本地提交，除非用户明确要求
+- **阅读顺序**：根 `AGENTS.md` → `session/AGENTS.md` → `gateway/AGENTS.md` → `examples/haitun-workspace/AGENTS.md` 或 `spa-v2/AGENTS.md`
+- **各区验收命令看本层文档**：Python 侧见上面「开发命令」；前端侧见 `spa-v2/AGENTS.md`「本地开发」（`npm run build` 后经 Gateway 硬刷验收，该目录没有 `npm test`）
 
 ## 改动后自检清单（Definition of Done）
 
