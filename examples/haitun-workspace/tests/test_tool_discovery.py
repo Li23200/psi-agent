@@ -20,8 +20,9 @@ from typing import Any
 
 import anyio
 import httpx
+import pytest
 
-from psi_agent.session.tool_registry import ToolFunction
+from psi_agent.session.tool_registry import ToolFunction, ToolRegistry
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = WORKSPACE_ROOT / "tools"
@@ -85,7 +86,7 @@ async def test_memory_read_tools_route_one_explicit_visibility(monkeypatch):
     assert organization["ok"] is True
     assert invalid["error"]["code"] == "invalid_argument"
     assert memory.calls == [("memory_search", {"query": "release plan", "limit": 8, "visibility": "personal"}, True)]
-    assert memory.organization_calls == [
+    assert memory.organization_read_calls == [
         ("memory_search", {"query": "release plan", "limit": 8, "visibility": "organization"}, True)
     ]
     search_schema = ToolFunction.from_callable(search_module.memory_search).parameters["properties"]
@@ -136,7 +137,7 @@ async def test_organization_memory_add_exposes_fact_fields_without_identity(monk
 
     assert result["ok"] is True
     assert memory.calls == []
-    name, arguments, retryable = memory.organization_calls[0]
+    name, arguments, retryable = memory.organization_write_calls[0]
     assert name == "organization_memory_add"
     assert retryable is False
     assert arguments == {
@@ -151,7 +152,7 @@ async def test_organization_memory_add_exposes_fact_fields_without_identity(monk
     }
 
 
-async def test_organization_router_refreshes_stale_membership_once(monkeypatch):
+async def test_organization_write_router_refreshes_stale_membership_once(monkeypatch):
     mcp_module = importlib.import_module("_fusion_memory_mcp")
     router = mcp_module.MemoryMcpRouter(SimpleNamespace())
     sync_calls: list[tuple[str, bool]] = []
@@ -172,7 +173,7 @@ async def test_organization_router_refreshes_stale_membership_once(monkeypatch):
     monkeypatch.setattr(router, "call_tool_for_session", call_for_session)
     monkeypatch.setattr(mcp_module, "get_session_id", lambda: "feishu-ou_member1")
 
-    result = await router.call_organization_tool("memory_search", {"query": "project"}, retryable=True)
+    result = await router.call_organization_write_tool("memory_search", {"query": "project"}, retryable=True)
 
     assert result == {"ok": True}
     assert sync_calls == [("ou_member1", True), ("ou_member1", True)]
@@ -182,7 +183,7 @@ async def test_organization_router_refreshes_stale_membership_once(monkeypatch):
     ]
 
 
-async def test_organization_router_rechecks_cached_member_before_memory_access(monkeypatch):
+async def test_organization_write_router_rechecks_cached_member_before_memory_access(monkeypatch):
     mcp_module = importlib.import_module("_fusion_memory_mcp")
     router = mcp_module.MemoryMcpRouter(SimpleNamespace())
     tool_calls: list[str] = []
@@ -208,10 +209,230 @@ async def test_organization_router_rechecks_cached_member_before_memory_access(m
     monkeypatch.setattr(router, "call_tool_for_session", call_for_session)
     monkeypatch.setattr(mcp_module, "get_session_id", lambda: "feishu-ou_former_member")
 
-    result = await router.call_organization_tool("memory_search", {"query": "project"}, retryable=True)
+    result = await router.call_organization_write_tool("memory_search", {"query": "project"}, retryable=True)
 
     assert result["error"]["code"] == "organization_access_denied"
     assert tool_calls == []
+
+
+@pytest.mark.parametrize(
+    ("auto_register", "replay_result", "expected_replays"),
+    [
+        (True, {"ok": True, "result": {"status": "ok"}}, 1),
+        (True, {"ok": False, "error": {"code": "organization_required", "retryable": False}}, 1),
+        (False, {"ok": True}, 0),
+    ],
+)
+async def test_organization_write_router_reregisters_at_most_once(
+    monkeypatch,
+    auto_register,
+    replay_result,
+    expected_replays,
+):
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    router = mcp_module.MemoryMcpRouter(SimpleNamespace(auto_register_feishu=auto_register))
+    required = {"ok": False, "error": {"code": "organization_required", "retryable": False}}
+    replay_calls: list[str] = []
+
+    async def sync_membership(_config, _open_id: str, *, force: bool = False):
+        assert force is True
+        return {"ok": True}
+
+    async def call_for_session(_session_id: str, _name: str, _arguments: dict[str, Any], *, retryable: bool):
+        del retryable
+        return required
+
+    async def replay(session_id: str, _name: str, _arguments: dict[str, Any], *, retryable: bool):
+        del retryable
+        replay_calls.append(session_id)
+        return replay_result
+
+    monkeypatch.setattr(mcp_module, "sync_current_membership", sync_membership)
+    monkeypatch.setattr(router, "call_tool_for_session", call_for_session)
+    monkeypatch.setattr(router, "_call_with_refreshed_registration", replay)
+    monkeypatch.setattr(mcp_module, "get_session_id", lambda: "feishu-ou_member1")
+
+    result = await router.call_organization_write_tool("memory_search", {"query": "project"}, retryable=True)
+
+    assert result == (replay_result if expected_replays else required)
+    assert replay_calls == ["feishu-ou_member1"] * expected_replays
+
+
+async def test_organization_read_router_skips_membership_sync(monkeypatch):
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    router = mcp_module.MemoryMcpRouter(SimpleNamespace(auto_register_feishu=False))
+    tool_calls: list[str] = []
+
+    async def unexpected_sync(*_args, **_kwargs):
+        raise AssertionError("organization reads must not require writer-group membership")
+
+    async def call_for_session(_session_id: str, name: str, _arguments: dict[str, Any], *, retryable: bool):
+        del retryable
+        tool_calls.append(name)
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_module, "sync_current_membership", unexpected_sync)
+    monkeypatch.setattr(router, "call_tool_for_session", call_for_session)
+    monkeypatch.setattr(mcp_module, "get_session_id", lambda: "feishu-ou_reader1")
+
+    result = await router.call_organization_read_tool("memory_search", {"query": "project"}, retryable=True)
+
+    assert result == {"ok": True}
+    assert tool_calls == ["memory_search"]
+
+
+async def test_registration_refresh_returns_safe_configuration_error(monkeypatch):
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    router = mcp_module.MemoryMcpRouter(SimpleNamespace(auto_register_feishu=True))
+
+    async def reject_refresh(_session_id: str, _config: Any):
+        raise mcp_module.MemoryConfigError(
+            "registration_failed",
+            "Fusion Memory registration failed",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(mcp_module, "refresh_feishu_registration", reject_refresh)
+
+    result = await router._call_with_refreshed_registration("feishu-ou_member1", "memory_search", {}, retryable=True)
+
+    assert result == {
+        "ok": False,
+        "error": {
+            "code": "registration_failed",
+            "message": "Fusion Memory registration failed",
+            "retryable": True,
+        },
+    }
+
+
+async def test_memory_router_reregisters_once_after_unauthorized(monkeypatch):
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    config = SimpleNamespace(auto_register_feishu=True)
+    router = mcp_module.MemoryMcpRouter(config)
+    stale = SimpleNamespace(token="stale-token")
+    fresh = SimpleNamespace(token="fresh-token")
+    calls: list[tuple[str, str]] = []
+
+    class Client:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        async def call_tool(self, name: str, _arguments: dict[str, Any], *, retryable: bool):
+            del retryable
+            calls.append((self.token, name))
+            if self.token == "stale-token":
+                return mcp_module._TransportAuthRejectedResult(
+                    {"ok": False, "error": {"code": "unauthorized", "retryable": False}}
+                )
+            return {"ok": True, "result": {"status": "ok"}}
+
+    async def resolve(_session_id: str, _config: Any):
+        return stale
+
+    refresh_calls: list[str] = []
+
+    async def refresh(session_id: str, _config: Any):
+        refresh_calls.append(session_id)
+        return fresh
+
+    def client_for(_session_id: str, resolved: Any):
+        return Client(resolved.token), None
+
+    monkeypatch.setattr(mcp_module, "resolve_memory_config", resolve)
+    monkeypatch.setattr(mcp_module, "refresh_feishu_registration", refresh)
+    monkeypatch.setattr(router, "_client_for", client_for)
+
+    result = await router.call_tool_for_session("feishu-ou_a", "memory_health", {}, retryable=True)
+
+    assert result == {"ok": True, "result": {"status": "ok"}}
+    assert refresh_calls == ["feishu-ou_a"]
+    assert calls == [("stale-token", "memory_health"), ("fresh-token", "memory_health")]
+
+
+async def test_memory_client_marks_http_auth_rejection_out_of_band():
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    client = mcp_module.MemoryMcpClient("https://memory.example.invalid/mcp", "stale-token")
+    request = mcp_module._Request("memory_add", {"content": "one"}, False)
+
+    class Session:
+        async def call_tool(self, _name: str, _arguments: dict[str, Any]):
+            http_request = httpx.Request("POST", "https://memory.example.invalid/mcp")
+            response = httpx.Response(401, request=http_request)
+            raise httpx.HTTPStatusError("unauthorized", request=http_request, response=response)
+
+    async def connect():
+        return Session()
+
+    async def disconnect():
+        return None
+
+    result = await client._execute(request, connect, disconnect)
+
+    assert isinstance(result, mcp_module._TransportAuthRejectedResult)
+    assert result == {
+        "ok": False,
+        "error": {"code": "unauthorized", "message": "Fusion Memory authentication failed", "retryable": False},
+    }
+
+
+async def test_memory_router_does_not_replay_tool_level_unauthorized(monkeypatch):
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    config = SimpleNamespace(auto_register_feishu=True)
+    router = mcp_module.MemoryMcpRouter(config)
+    resolved = SimpleNamespace(token="current-token")
+    calls: list[str] = []
+
+    class Client:
+        async def call_tool(self, name: str, _arguments: dict[str, Any], *, retryable: bool):
+            del retryable
+            calls.append(name)
+            return {
+                "ok": False,
+                "error": {"code": "unauthorized", "retryable": False},
+                "_fusion_memory_transport_auth_rejected": True,
+            }
+
+    async def resolve(_session_id: str, _config: Any):
+        return resolved
+
+    async def unexpected_refresh(_session_id: str, _config: Any):
+        raise AssertionError("tool-level unauthorized must not refresh credentials")
+
+    monkeypatch.setattr(mcp_module, "resolve_memory_config", resolve)
+    monkeypatch.setattr(mcp_module, "refresh_feishu_registration", unexpected_refresh)
+    monkeypatch.setattr(router, "_client_for", lambda _session_id, _resolved: (Client(), None))
+
+    result = await router.call_tool_for_session("feishu-ou_a", "memory_add", {"content": "one"}, retryable=False)
+
+    assert result == {
+        "ok": False,
+        "error": {"code": "unauthorized", "retryable": False},
+        "_fusion_memory_transport_auth_rejected": True,
+    }
+    assert calls == ["memory_add"]
+
+
+async def test_memory_activation_logs_safe_configuration_error(monkeypatch):
+    mcp_module = importlib.import_module("_fusion_memory_mcp")
+    router = mcp_module.MemoryMcpRouter(SimpleNamespace())
+    warnings: list[tuple[object, ...]] = []
+
+    async def reject(_session_id: str, _config: Any):
+        raise mcp_module.MemoryConfigError(
+            "registration_credentials_incomplete",
+            "secret-value must never be logged",
+        )
+
+    monkeypatch.setattr(mcp_module, "resolve_memory_config", reject)
+    monkeypatch.setattr(mcp_module, "get_session_id", lambda: "feishu-ou_a")
+    monkeypatch.setattr(mcp_module.logger, "warning", lambda *args: warnings.append(args))
+
+    result = await router.activate_current_session(WORKSPACE_ROOT)
+
+    assert result["error"]["code"] == "registration_credentials_incomplete"
+    assert warnings == [("Fusion Memory activation skipped: {}", "registration_credentials_incomplete")]
+    assert "secret-value" not in json.dumps(warnings)
 
 
 async def test_membership_assertion_reflects_group_roster(monkeypatch):
@@ -417,14 +638,15 @@ async def test_assignment_upsert_binds_session_identity_and_normalizes_fields(mo
     memory = _MemoryStub(
         assignment_upsert=[{"ok": True, "result": {"assignment_id": "wa-1"}}],
     )
-    module = _import_assignment_module("assignment_upsert", memory, monkeypatch)
+    feishu = _FeishuStub()
+    module = _import_assignment_module("assignment_upsert", memory, monkeypatch, feishu=feishu)
 
     result = json.loads(
         await module.assignment_upsert(
             json.dumps(
                 {
                     "title": "整理会议结论",
-                    "assigner": {"user_id": "untrusted"},
+                    "assigner": {"user_id": "untrusted", "display_name": "消息上下文姓名"},
                     "recipients": [{"user_id": "recipient"}],
                     "gaps": ["截止时间待确认"],
                     "risks": ["不要把推测写成事实"],
@@ -440,13 +662,42 @@ async def test_assignment_upsert_binds_session_identity_and_normalizes_fields(mo
     forwarded = memory.calls[0][1]["assignment"]
     assert forwarded["assigner"] == {
         "user_id": "ou_assigner",
-        "display_name": "ou_assigner",
+        "display_name": "通讯录安排者",
         "feishu_open_id": "ou_assigner",
     }
     assert forwarded["gaps"] == [{"description": "截止时间待确认"}]
     assert forwarded["risks"] == [{"description": "不要把推测写成事实"}]
     assert forwarded["action_items"] == [{"description": "提交方案"}]
     assert forwarded["evidence_refs"] == [{"uri": "https://example.com/source"}]
+
+
+async def test_assignment_modules_export_only_their_declared_tools(tmp_path):
+    module_names = ("assignment_upsert", "assignment_send_card", "assignment_feedback")
+    for module_name in module_names:
+        source = await anyio.Path(TOOLS_DIR / f"{module_name}.py").read_text(encoding="utf-8")
+        await anyio.Path(tmp_path / f"{module_name}.py").write_text(source, encoding="utf-8")
+
+    loaded = await ToolRegistry._load_from_dir(tmp_path, "assignment-export-test")
+
+    for module_name in module_names:
+        entry = loaded[str(tmp_path / f"{module_name}.py")]
+        assert set(entry.tools) == {module_name}
+
+
+async def test_assignment_upsert_omits_model_name_when_directory_lookup_fails(monkeypatch):
+    async def unavailable(*_args, **_kwargs):
+        return {"ok": False, "error": {"code": "forbidden"}}
+
+    module = _import_assignment_module("assignment_upsert", _MemoryStub(), monkeypatch)
+    monkeypatch.setattr(module, "_get_users_batch_impl", unavailable)
+    assignment = {"assigner": {"user_id": "untrusted", "display_name": "模型猜测姓名"}}
+
+    await module._bind_assigner_to_current_feishu_session(assignment)
+
+    assert assignment["assigner"] == {
+        "user_id": "ou_assigner",
+        "feishu_open_id": "ou_assigner",
+    }
 
 
 async def test_assignment_feedback_validates_before_memory_calls(monkeypatch):
@@ -537,12 +788,23 @@ async def test_assignment_feedback_card_names_author_and_uses_authoritative_titl
         assignment_feedback=[
             {
                 "ok": True,
-                "result": _feedback_thread(entries=[_feedback_entry(author_open_id="ou_recipient")]),
+                "result": _feedback_thread(
+                    entries=[
+                        _feedback_entry(author_open_id="ou_recipient"),
+                        _feedback_entry(
+                            author_role="assigner",
+                            entry_type="reply",
+                            raw_content="先按推荐方案推进。",
+                            version=2,
+                            author_open_id="ou_assigner",
+                        ),
+                    ]
+                ),
             },
             {"ok": True, "result": _feedback_thread(card_id="om_feedback")},
         ],
     )
-    feishu = _FeishuStub()
+    feishu = _FeishuStub(user_names={"ou_assigner": "王安排", "ou_recipient": "李接收"})
     module = _import_assignment_module(
         "assignment_feedback",
         memory,
@@ -556,7 +818,8 @@ async def test_assignment_feedback_card_names_author_and_uses_authoritative_titl
     assert result["ok"] is True
     card_json = feishu.sent_cards[0]["card_json"]
     # The card names the real feedback author instead of only the bare role label.
-    assert "v1 李接收 (接收者): 如果大量人不回复怎么办?" in card_json
+    assert "1. v1 李接收 (接收者): 如果大量人不回复怎么办?" in card_json
+    assert "2. v2 王安排 (安排者): 先按推荐方案推进。" in card_json
     # The visible task line uses the authoritative assignment title, never the placeholder.
     assert "所属任务: 整理会议结论" in card_json
     assert "当前工作安排" not in card_json
@@ -592,7 +855,13 @@ async def test_assignment_feedback_uses_entry_open_id_for_multi_recipient_author
             {"ok": True, "result": _feedback_thread(card_id="om_feedback")},
         ],
     )
-    feishu = _FeishuStub()
+    feishu = _FeishuStub(
+        user_names={
+            "ou_assigner": "安排人员",
+            "ou_recipient_one": "第一接收人",
+            "ou_recipient_two": "第二接收人",
+        }
+    )
     module = _import_assignment_module(
         "assignment_feedback",
         memory,
@@ -694,8 +963,8 @@ async def test_assignment_feedback_falls_back_when_assignment_record_is_unavaila
 async def test_assignment_feedback_callback_names_the_replying_assigner(monkeypatch):
     assignment = {
         **_assignment(),
-        "assigner": {"display_name": "王安排", "feishu_open_id": "ou_assigner"},
-        "recipients": [{"display_name": "李接收", "feishu_open_id": "ou_recipient"}],
+        "assigner": {"display_name": "伪造安排者", "feishu_open_id": "ou_assigner"},
+        "recipients": [{"display_name": "伪造接收者", "feishu_open_id": "ou_recipient"}],
     }
     replied = _feedback_thread(
         card_id="om_feedback",
@@ -715,7 +984,7 @@ async def test_assignment_feedback_callback_names_the_replying_assigner(monkeypa
         assignment_get=[{"ok": True, "result": assignment}],
         assignment_feedback=[{"ok": True, "result": replied}],
     )
-    feishu = _FeishuStub()
+    feishu = _FeishuStub(user_names={"ou_assigner": "王安排", "ou_recipient": "李接收"})
     module = _import_assignment_module(
         "assignment_feedback",
         memory,
@@ -752,10 +1021,23 @@ async def test_assignment_feedback_callback_names_the_replying_assigner(monkeypa
     )
 
     assert result["ok"] is True
+    assert len(feishu.edits) == 1
+    assert len(feishu.sent_cards) == 1
     # Each entry keeps its own author; the reply must not inherit the original author's name.
     for card_json in [edit["card_json"] for edit in feishu.edits] + [card["card_json"] for card in feishu.sent_cards]:
+        card = json.loads(card_json)
+        entry_block = next(
+            element["text"]["content"]
+            for element in card["elements"]
+            if isinstance(element, dict)
+            and isinstance(element.get("text"), dict)
+            and str(element["text"].get("content", "")).startswith("1. v1")
+        )
+        assert entry_block == ("1. v1 李接收 (接收者): 如果大量人不回复怎么办?\n\n2. v2 王安排 (安排者): 继续私信")
         assert "v1 李接收 (接收者): 如果大量人不回复怎么办?" in card_json
         assert "v2 王安排 (安排者): 继续私信" in card_json
+        assert "伪造安排者" not in card_json
+        assert "伪造接收者" not in card_json
         # A stale placeholder carried in the callback projection must not survive.
         assert "当前工作安排" not in card_json
         assert "所属任务: 整理会议结论" in card_json
@@ -843,8 +1125,13 @@ async def test_assignment_send_card_claims_before_each_external_send(monkeypatch
         progress_message_id="om_progress",
         revision=5,
     )
+    assignment = {
+        **_assignment(),
+        "assigner": {"display_name": "伪造安排者", "feishu_open_id": "ou_assigner"},
+        "action_items": [{"description": "提交方案", "owner": "伪造负责人"}],
+    }
     memory = _MemoryStub(
-        assignment_get=[{"ok": True, "result": _assignment()}],
+        assignment_get=[{"ok": True, "result": assignment}],
         assignment_delivery=[
             {"ok": True, "result": pending},
             _claim("recipient", recipient_claimed),
@@ -868,8 +1155,39 @@ async def test_assignment_send_card_claims_before_each_external_send(monkeypatch
     ]
     assert [call["receive_id"] for call in feishu.cards] == ["ou_recipient", "ou_assigner"]
     recipient_card = json.loads(feishu.cards[0]["card_json"])
+    recipient_card_json = feishu.cards[0]["card_json"]
+    assert recipient_card["elements"][0]["text"]["content"] == "任务: 整理会议结论\n安排者: 通讯录安排者"
+    assert "伪造安排者" not in recipient_card_json
+    assert "伪造负责人" not in recipient_card_json
+    assert "直接告诉 HaiTun" in recipient_card["elements"][-1]["text"]["content"]
+    assert "反馈会保留在本任务中并同步给安排者" in recipient_card["elements"][-1]["text"]["content"]
     assert _button_values(recipient_card) == [{"action": "confirm_assignment_receipt", "assignment_id": "wa-1"}]
     assert "wa-1" not in feishu.cards[1]["card_json"]
+
+
+async def test_assignment_card_hides_internal_identifiers(monkeypatch):
+    module = _import_assignment_module("assignment_send_card", _MemoryStub(), monkeypatch)
+
+    card = module._build_assignment_card(
+        assignment={"original_request": "请整理会议结论。"},
+        assignment_id="wa-internal",
+        title="整理会议结论",
+        assigner_name="ou_internal_assigner",
+    )
+
+    heading = card["elements"][0]["text"]["content"]
+    assert heading == "任务: 整理会议结论\n安排者: 安排者"
+    for identifier in (
+        "ou_internal_user",
+        "wa-51fe97853d0fee03",
+        "feedback-1",
+        "user-recipient",
+        "8fe4097f-01a4-4e65-872c-5cbca69dd703",
+        "安排者 (ou_internal_user)",
+        "018f47a2-7b31-7e65-8f42-123456789abc",
+    ):
+        assert module.readable_name(identifier) is None
+    assert module.readable_name("Jason-Lee") == "Jason-Lee"
 
 
 async def test_assignment_accept_publishes_once_and_invites_discussion(monkeypatch):
@@ -1013,7 +1331,8 @@ class _MemoryStub:
     def __init__(self, **responses: list[dict[str, Any]]) -> None:
         self.responses = {name: list(values) for name, values in responses.items()}
         self.calls: list[tuple[str, dict[str, Any], bool]] = []
-        self.organization_calls: list[tuple[str, dict[str, Any], bool]] = []
+        self.organization_read_calls: list[tuple[str, dict[str, Any], bool]] = []
+        self.organization_write_calls: list[tuple[str, dict[str, Any], bool]] = []
 
     async def call_tool(self, name: str, arguments: dict[str, Any], *, retryable: bool) -> dict[str, Any]:
         self.calls.append((name, arguments, retryable))
@@ -1025,8 +1344,22 @@ class _MemoryStub:
             "error": {"code": "not_configured", "message": f"no response for {name}", "retryable": False},
         }
 
-    async def call_organization_tool(self, name: str, arguments: dict[str, Any], *, retryable: bool) -> dict[str, Any]:
-        self.organization_calls.append((name, arguments, retryable))
+    async def call_organization_read_tool(
+        self, name: str, arguments: dict[str, Any], *, retryable: bool
+    ) -> dict[str, Any]:
+        self.organization_read_calls.append((name, arguments, retryable))
+        queue = self.responses.get(name)
+        if queue:
+            return queue.pop(0)
+        return {
+            "ok": False,
+            "error": {"code": "not_configured", "message": f"no response for {name}", "retryable": False},
+        }
+
+    async def call_organization_write_tool(
+        self, name: str, arguments: dict[str, Any], *, retryable: bool
+    ) -> dict[str, Any]:
+        self.organization_write_calls.append((name, arguments, retryable))
         queue = self.responses.get(name)
         if queue:
             return queue.pop(0)
@@ -1037,13 +1370,27 @@ class _MemoryStub:
 
 
 class _FeishuStub:
-    def __init__(self) -> None:
+    def __init__(self, *, user_names: dict[str, str] | None = None) -> None:
         self.cards: list[dict[str, str]] = []
         self.sent_cards: list[dict[str, str]] = []
         self.edits: list[dict[str, str]] = []
         self.messages: list[dict[str, str]] = []
         self.reads: list[str] = []
         self.tasks: list[dict[str, str]] = []
+        self.user_names = user_names or {}
+
+    async def get_users_batch_impl(
+        self,
+        user_ids: str,
+        user_id_type: str = "open_id",
+        department_id_type: str = "open_department_id",
+    ) -> dict[str, Any]:
+        del user_id_type, department_id_type
+        users = [
+            {"open_id": open_id, "name": self.user_names.get(open_id, "通讯录安排者")}
+            for open_id in user_ids.split(",")
+        ]
+        return {"ok": True, "users": users, "count": len(users)}
 
     async def feishu_message_send_card(
         self,
@@ -1266,6 +1613,7 @@ def _import_assignment_module(
             "edit_card_impl": feishu.edit_card_impl,
             "send_message_impl": feishu.send_message_impl,
             "read_status_impl": feishu.read_status_impl,
+            "get_users_batch_impl": feishu.get_users_batch_impl,
         }
     )
     monkeypatch.setitem(sys.modules, "_feishu_impl", impl_module)
