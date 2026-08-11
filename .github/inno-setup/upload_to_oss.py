@@ -14,7 +14,7 @@ import os
 import sys
 
 try:
-    import oss2
+    import oss2  # ty: ignore[unresolved-import]
 except ImportError:
     raise SystemExit("oss2 is not installed; run: python -m pip install oss2") from None
 
