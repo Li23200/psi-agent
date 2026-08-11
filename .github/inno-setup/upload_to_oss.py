@@ -13,6 +13,11 @@ Optional env:
 import os
 import sys
 
+try:
+    import oss2
+except ImportError:
+    raise SystemExit("oss2 is not installed; run: python -m pip install oss2") from None
+
 
 def _require_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -22,11 +27,6 @@ def _require_env(name: str) -> str:
 
 
 def main() -> None:
-    try:
-        import oss2
-    except ImportError:
-        raise SystemExit("oss2 is not installed; run: python -m pip install oss2")
-
     access_key_id = _require_env("ALIYUN_ACCESS_KEY_ID")
     access_key_secret = _require_env("ALIYUN_ACCESS_KEY_SECRET")
     bucket_name = _require_env("ALIYUN_OSS_BUCKET")
@@ -66,9 +66,7 @@ def main() -> None:
         "x-oss-object-acl": "public-read",
     }
     bucket.put_object_from_file(stable_key, installer, headers=exe_headers)
-    print(f"Uploaded {stable_key}")
     bucket.put_object_from_file(versioned_key, installer, headers=exe_headers)
-    print(f"Uploaded {versioned_key}")
     bucket.put_object(
         version_key,
         version + "\n",
@@ -78,7 +76,6 @@ def main() -> None:
             "x-oss-object-acl": "public-read",
         },
     )
-    print(f"Uploaded {version_key} = {version}")
 
 
 if __name__ == "__main__":
