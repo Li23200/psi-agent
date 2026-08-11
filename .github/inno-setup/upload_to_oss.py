@@ -60,7 +60,8 @@ def main() -> None:
         "x-oss-object-acl": "public-read",
     }
     bucket.put_object_from_file(stable_key, installer, headers=exe_headers)
-    bucket.put_object_from_file(versioned_key, installer, headers=exe_headers)
+    copy_headers = {**exe_headers, "x-oss-metadata-directive": "REPLACE"}
+    bucket.copy_object(bucket_name, stable_key, versioned_key, headers=copy_headers)
     bucket.put_object(
         version_key,
         version + "\n",

@@ -38,15 +38,8 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::haitun.iss was not changed in this commit; skipping OSS publish"
+            echo "::notice::haitun.iss was not changed; upload only runs if OSS version differs"
           fi
-
-      - name: Download installer artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: haitun-agent-installer-nuitka
-          path: installer
-          run-id: ${{ github.event.workflow_run.id }}
 
       - name: Read installer version
         id: metadata
@@ -92,6 +85,15 @@ jobs:
             echo "::notice::OSS version.txt not available (HTTP ${CODE:-unknown}); publishing"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Download installer artifact
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: haitun-agent-installer-nuitka
+          path: installer
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload installer and version.txt to Aliyun OSS
         if: steps.check.outputs.skip != 'true'

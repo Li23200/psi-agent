@@ -220,8 +220,13 @@ static int fetch_remote_text(const WCHAR *url, WCHAR *out, int out_cch)
     if (!total)
         return 0;
     raw[total] = '\0';
-    MultiByteToWideChar(CP_UTF8, 0, raw, (int)total, out, out_cch - 1);
-    out[out_cch - 1] = L'\0';
+    {
+        int n = MultiByteToWideChar(CP_UTF8, 0, raw, (int)total, out, out_cch - 1);
+        if (n <= 0)
+            out[0] = L'\0';
+        else
+            out[n] = L'\0';
+    }
     trim_whitespace(out);
     return 1;
 }
@@ -238,6 +243,17 @@ static void join_url(WCHAR *out, int out_cch, const WCHAR *base, const WCHAR *su
         out[n] = L'\0';
     }
     lstrcatW(out, suffix);
+}
+
+static int starts_with_https(const WCHAR *s)
+{
+    static const WCHAR prefix[] = L"https://";
+    int i;
+    for (i = 0; i < 8; i++) {
+        if (s[i] != prefix[i])
+            return 0;
+    }
+    return s[8] != L'\0';
 }
 
 static void configure_updater(void)
@@ -261,7 +277,7 @@ static void configure_updater(void)
         if (hours > 0 && hours <= 24 * 30)
             g_update_interval_ms = (DWORD)((DWORD)hours * 60u * 60u * 1000u);
     }
-    if (base && base[0]) {
+    if (base && base[0] && starts_with_https(base)) {
         const WCHAR *installer_name =
             (installer && installer[0]) ? installer : L"HaiTun_Agent_Setup.exe";
         join_url(g_version_url, MAX_UPDATE_URL, base, L"version.txt");
@@ -277,13 +293,9 @@ static DWORD WINAPI update_check_thread(LPVOID unused)
 
     for (;;) {
         WCHAR latest[UPDATE_VERSION_BUF];
-        Sleep(g_update_interval_ms);
         latest[0] = L'\0';
-        if (!fetch_remote_text(g_version_url, latest, UPDATE_VERSION_BUF))
-            continue;
-        if (!latest[0] || lstrcmpW(latest, g_local_version) == 0)
-            continue;
-        {
+        if (fetch_remote_text(g_version_url, latest, UPDATE_VERSION_BUF) &&
+            latest[0] && lstrcmpW(latest, g_local_version) != 0) {
             WCHAR msg[512];
             wsprintfW(msg,
                       L"HaiTun Agent 发现新版本 %s，当前版本为 %s。\n\n"
@@ -313,6 +325,7 @@ static DWORD WINAPI update_check_thread(LPVOID unused)
                 }
             }
         }
+        Sleep(g_update_interval_ms);
     }
     return 0;
 }
