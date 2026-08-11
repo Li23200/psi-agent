@@ -36,9 +36,7 @@ def main() -> None:
     prefix = os.environ.get("ALIYUN_OSS_PREFIX", "").strip().strip("/")
     if prefix in ("", ".", "-", "root", "ROOT"):
         prefix = ""
-    installer_name = os.environ.get(
-        "HAITUN_UPDATE_INSTALLER_NAME", "HaiTun_Agent_Setup.exe"
-    ).strip()
+    installer_name = os.environ.get("HAITUN_UPDATE_INSTALLER_NAME", "HaiTun_Agent_Setup.exe").strip()
     if not installer_name:
         installer_name = "HaiTun_Agent_Setup.exe"
     installer = os.environ.get(
@@ -53,11 +51,7 @@ def main() -> None:
 
     base_name, ext = os.path.splitext(installer_name)
     stable_key = f"{prefix}/{installer_name}" if prefix else installer_name
-    versioned_key = (
-        f"{prefix}/{base_name}-{version}{ext}"
-        if prefix
-        else f"{base_name}-{version}{ext}"
-    )
+    versioned_key = f"{prefix}/{base_name}-{version}{ext}" if prefix else f"{base_name}-{version}{ext}"
     version_key = f"{prefix}/version.txt" if prefix else "version.txt"
 
     exe_headers = {
