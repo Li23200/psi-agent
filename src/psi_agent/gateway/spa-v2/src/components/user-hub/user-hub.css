@@ -5,6 +5,34 @@
   width: 100%;
 }
 
+.user-hub-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  margin-bottom: 8px;
+  padding: 0 10px;
+  border: 1px dashed rgba(var(--brand-rgb), 0.45);
+  border-radius: 10px;
+  background: rgba(var(--brand-rgb), 0.08);
+  color: #cfe2f5;
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.user-hub-feedback:hover {
+  border-style: solid;
+  border-color: var(--brand-500);
+  background: rgba(var(--brand-rgb), 0.16);
+  color: #eaf4ff;
+}
+
+.user-hub-feedback > svg {
+  flex-shrink: 0;
+}
+
 .user-hub-row {
   display: flex;
   align-items: center;
@@ -1002,8 +1030,7 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  .hub-otp.bad,
-  .hub-agree .box.shake {
+  .hub-otp.bad {
     animation: none;
   }
 }
@@ -1049,55 +1076,6 @@ button.hub-login-resend {
   min-height: 46px;
   font-size: 15px;
   justify-content: center;
-}
-/* ---------- 协议勾选（A1）---------- */
-.hub-agree {
-  display: flex;
-  gap: 9px;
-  margin: 14px 0 4px;
-  font-size: 12px;
-  line-height: 1.7;
-  color: var(--ink-soft);
-}
-
-.hub-agree > button {
-  flex: none;
-  margin-top: 2px;
-  padding: 0;
-  border: 0;
-  background: none;
-  cursor: pointer;
-  line-height: 0;
-}
-
-.hub-agree .box {
-  width: 16px;
-  height: 16px;
-  display: grid;
-  place-items: center;
-  border-radius: 5px;
-  border: 1.5px solid #b7c6d8;
-  background: var(--paper);
-  color: transparent;
-  font-size: 10px;
-}
-
-.hub-agree .box.on {
-  background: var(--brand-500);
-  border-color: var(--brand-500);
-  color: #fff;
-}
-
-/* 未勾选就点主按钮：抖动 420ms，不弹 Toast */
-.hub-agree .box.shake {
-  border-color: var(--coral);
-  animation: hub-otp-nudge 420ms ease;
-}
-
-.hub-agree a {
-  color: var(--brand-600);
-  text-decoration: none;
-  font-weight: 600;
 }
 /* ---------- 提示条：info / warn / bad / ok ---------- */
 .hub-tip {
