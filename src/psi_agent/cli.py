@@ -44,12 +44,20 @@ class SelfUpdate:
     yes: bool = False
     """Apply the update without asking (used by haitun.exe)."""
 
+    haitun_pid: int | None = None
+    """PID of the haitun.exe launcher (set by haitun.exe itself)."""
+
+    gateway_pid: int | None = None
+    """PID of the running gateway to wait for before the directory swap."""
+
     async def run(self) -> None:
         result = run_self_update(
             base_url=self.base_url or "",
             install_dir=self.install_dir or "",
             check_only=self.check_only,
             yes=self.yes,
+            haitun_pid=self.haitun_pid,
+            gateway_pid=self.gateway_pid,
         )
         messages = {
             "up-to-date": ("已是最新版本。", 0),

@@ -97,6 +97,8 @@ def run_self_update(
     install_dir: str = "",
     check_only: bool = False,
     yes: bool = False,
+    haitun_pid: int | None = None,
+    gateway_pid: int | None = None,
     allow_insecure: bool = False,
 ) -> str:
     root = updates_root()
@@ -168,7 +170,14 @@ def run_self_update(
         ),
     )
     try:
-        apply_mod.launch_bootstrap(root, install, staging, backup)
+        apply_mod.launch_bootstrap(
+            root,
+            install,
+            staging,
+            backup,
+            haitun_pid=haitun_pid,
+            gateway_pid=gateway_pid,
+        )
     except OSError:
         apply_mod.write_state(
             root,

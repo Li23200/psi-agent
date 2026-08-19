@@ -51,10 +51,14 @@ def launch_bootstrap(
     install_dir: Path,
     staging: Path,
     backup: Path,
+    haitun_pid: int | None = None,
+    gateway_pid: int | None = None,
 ) -> subprocess.Popen[bytes]:
     exe = updates_root / BOOTSTRAP_NAME
     if not exe.is_file():
         raise FileNotFoundError(f"bootstrap not found: {exe}")
     cmd = [str(exe), str(install_dir), str(staging), str(backup), str(updates_root)]
+    if haitun_pid is not None and gateway_pid is not None:
+        cmd += [str(haitun_pid), str(gateway_pid)]
     creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     return subprocess.Popen(cmd, creationflags=creationflags)

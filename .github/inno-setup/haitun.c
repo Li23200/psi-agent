@@ -36,6 +36,7 @@ static WCHAR g_update_base_url[MAX_UPDATE_URL];
 static DWORD g_update_interval_ms = HAITUN_UPDATE_INTERVAL_MS;
 static int g_self_update_mode = 0;
 static HANDLE g_app_process = NULL;
+static DWORD g_gateway_pid = 0;
 
 /* ---- helpers ---- */
 
@@ -344,6 +345,8 @@ static void run_self_update(void)
     lstrcatW(cmd, L"\\psi-agent.exe\" self-update --base-url \"");
     lstrcatW(cmd, g_update_base_url);
     lstrcatW(cmd, L"\" --yes");
+    wsprintfW(cmd + lstrlenW(cmd), L" --haitun-pid %lu --gateway-pid %lu",
+              GetCurrentProcessId(), g_gateway_pid);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
     if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
@@ -355,93 +358,32 @@ static void run_self_update(void)
     }
 }
 
-static void delete_tree(const WCHAR *path)
+/* Kill the gateway and everything it spawned. The updater bootstrap is not a
+ * descendant of the gateway, so it is never touched by this tree kill. */
+static void kill_gateway_tree(void)
 {
-    WCHAR search[PATH_BUF];
-    WCHAR child[PATH_BUF];
-    WIN32_FIND_DATAW fd;
-    HANDLE h;
+    WCHAR cmd[256];
+    STARTUPINFOW si = {sizeof(si)};
+    PROCESS_INFORMATION pi = {0};
 
-    lstrcpyW(search, path);
-    lstrcatW(search, L"\\*");
-    h = FindFirstFileW(search, &fd);
-    if (h == INVALID_HANDLE_VALUE) {
-        RemoveDirectoryW(path);
+    if (g_gateway_pid == 0)
         return;
+    wsprintfW(cmd, L"taskkill.exe /PID %lu /T /F", g_gateway_pid);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+                       CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 10000);
+        if (pi.hThread) CloseHandle(pi.hThread);
+        if (pi.hProcess) CloseHandle(pi.hProcess);
     }
-    do {
-        if (lstrcmpW(fd.cFileName, L".") == 0 ||
-            lstrcmpW(fd.cFileName, L"..") == 0)
-            continue;
-        wsprintfW(child, L"%s\\%s", path, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            delete_tree(child);
-        else
-            DeleteFileW(child);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    RemoveDirectoryW(path);
-}
-
-/* Called once the new psi-agent.exe was successfully spawned: the update is
- * considered complete, so the old version backup can be deleted. */
-static void cleanup_after_update(void)
-{
-    WCHAR root[MAX_PATH];
-    WCHAR pending[MAX_PATH + 64];
-    WCHAR backup[PATH_BUF];
-    HANDLE h;
-    DWORD size = 0;
-    DWORD read = 0;
-    char buf[4096];
-    WCHAR prefix[PATH_BUF];
-    int n;
-    int removed = 0;
-
-    get_updates_root(root, MAX_PATH);
-    if (!root[0])
-        return;
-    wsprintfW(pending, L"%s\\cleanup-pending.txt", root);
-    h = CreateFileW(pending, GENERIC_READ, FILE_SHARE_READ, NULL,
-                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    size = GetFileSize(h, NULL);
-    if (size != INVALID_FILE_SIZE && size > 0 &&
-        size < (DWORD)sizeof(buf) &&
-        ReadFile(h, buf, size, &read, NULL) && read > 0) {
-        buf[read] = '\0';
-        MultiByteToWideChar(CP_UTF8, 0, buf, -1, backup, PATH_BUF);
-        n = lstrlenW(backup);
-        while (n > 0 && (backup[n - 1] == L'\r' || backup[n - 1] == L'\n'))
-            backup[--n] = L'\0';
-        wsprintfW(prefix, L"%s\\backups\\", root);
-        if (backup[0] && _wcsnicmp(backup, prefix, lstrlenW(prefix)) == 0) {
-            delete_tree(backup);
-            removed = (GetFileAttributesW(backup) == INVALID_FILE_ATTRIBUTES);
-        }
-    }
-    CloseHandle(h);
-    if (removed)
-        DeleteFileW(pending);
-}
-
-/* Delete the old-version backup only after the new gateway has been running
- * for a grace period. A crash within the window keeps the backup for
- * rollback. */
-static DWORD WINAPI cleanup_delay_thread(LPVOID unused)
-{
-    (void)unused;
-    Sleep(60000);
-    if (g_app_process && WaitForSingleObject(g_app_process, 0) == WAIT_TIMEOUT)
-        cleanup_after_update();
-    return 0;
 }
 
 /* ---- download progress window ---- */
 
 static HWND g_progress_hwnd = NULL;
 static WCHAR g_progress_version[64];
+static int g_progress_mode = 0;
 
 static LRESULT CALLBACK progress_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -449,14 +391,32 @@ static LRESULT CALLBACK progress_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LP
     case WM_CREATE:
     {
         HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        WCHAR text[256];
-        wsprintfW(text, L"正在下载新版本 %s 安装包，请稍候……", g_progress_version);
-        HWND label = CreateWindowExW(0, L"STATIC", text,
-                                     WS_CHILD | WS_VISIBLE | SS_CENTER,
-                                     18, 22, 324, 36,
-                                     hwnd, NULL, GetModuleHandleW(NULL), NULL);
-        if (label)
-            SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
+        if (g_progress_mode == 1) {
+            WCHAR text[256];
+            wsprintfW(text, L"正在准备 %s 更新，请稍候……", g_progress_version);
+            HWND label = CreateWindowExW(0, L"STATIC", text,
+                                         WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                         18, 18, 344, 36,
+                                         hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (label)
+                SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
+            HWND hint = CreateWindowExW(0, L"STATIC",
+                                        L"完成后将自动重启海豚，无需任何操作",
+                                        WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                        18, 60, 344, 28,
+                                        hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (hint)
+                SendMessageW(hint, WM_SETFONT, (WPARAM)font, TRUE);
+        } else {
+            WCHAR text[256];
+            wsprintfW(text, L"正在下载新版本 %s 安装包，请稍候……", g_progress_version);
+            HWND label = CreateWindowExW(0, L"STATIC", text,
+                                         WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                         18, 22, 324, 36,
+                                         hwnd, NULL, GetModuleHandleW(NULL), NULL);
+            if (label)
+                SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
+        }
         return 0;
     }
     case WM_CLOSE:
@@ -484,10 +444,10 @@ static DWORD WINAPI progress_window_thread(LPVOID unused)
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return 0;
 
-    hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+    hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOOLWINDOW,
                            L"HaiTunDownloadProgress", L"正在更新",
                            WS_POPUP | WS_CAPTION,
-                           CW_USEDEFAULT, CW_USEDEFAULT, 360, 100,
+                           CW_USEDEFAULT, CW_USEDEFAULT, 380, 120,
                            NULL, NULL, hInst, NULL);
     if (!hwnd)
         return 0;
@@ -514,11 +474,12 @@ static DWORD WINAPI progress_window_thread(LPVOID unused)
     return 0;
 }
 
-static HWND show_download_progress(const WCHAR *version)
+static HWND show_progress_window(const WCHAR *version, int mode)
 {
     int i;
     HANDLE hThread;
     g_progress_hwnd = NULL;
+    g_progress_mode = mode;
     g_progress_version[0] = L'\0';
     if (version && version[0])
         lstrcpynW(g_progress_version, version, 64);
@@ -528,6 +489,16 @@ static HWND show_download_progress(const WCHAR *version)
     for (i = 0; i < 50 && !g_progress_hwnd; i++)
         Sleep(20);
     return g_progress_hwnd;
+}
+
+static HWND show_download_progress(const WCHAR *version)
+{
+    return show_progress_window(version, 0);
+}
+
+static HWND show_update_progress(const WCHAR *version)
+{
+    return show_progress_window(version, 1);
 }
 
 static void hide_download_progress(HWND hwnd)
@@ -563,8 +534,11 @@ static DWORD WINAPI update_check_thread(LPVOID unused)
                  * the gateway and let haitun-updater.exe swap directories;
                  * otherwise fall back to the legacy installer download. */
                 if (g_self_update_mode && g_update_base_url[0] && g_app_process) {
+                    HWND update_progress = show_update_progress(latest);
                     run_self_update();
+                    hide_download_progress(update_progress);
                     if (swap_requested_exists()) {
+                        kill_gateway_tree();
                         TerminateProcess(g_app_process, 0);
                         return 0;
                     }
@@ -736,10 +710,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow)
                            CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                            g_env, g_dir, &si, &pi)) {
             g_app_process = pi.hProcess;
-            HANDLE hCleanup = CreateThread(NULL, 0, cleanup_delay_thread,
-                                           NULL, 0, NULL);
-            if (hCleanup)
-                CloseHandle(hCleanup);
+            g_gateway_pid = pi.dwProcessId;
         }
         if (pi.hThread) CloseHandle(pi.hThread);
         if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
