@@ -212,8 +212,11 @@ var
   S: String;
 begin
   Result := '';
-  if FileExists(FileName) and LoadStringFromFile(FileName, S) then
+  if FileExists(FileName) then
+  begin
+    LoadStringFromFile(FileName, S);
     Result := Trim(S);
+  end;
 end;
 
 function ComponentDir(const Name: String): String;
@@ -244,13 +247,11 @@ begin
   ForceDirectories(ExpandConstant('{app}'));
   Path := ExpandConstant('{app}\rollback-state.json');
   Tmp := Path + '.tmp';
-  Result := SaveStringToUTF8File(Tmp, Content, False);
-  if Result then
-  begin
-    if FileExists(Path) then
-      DeleteFile(Path);
-    Result := RenameFile(Tmp, Path);
-  end;
+  SaveStringToUTF8File(Tmp, Content, False);
+  Result := True;
+  if FileExists(Path) then
+    DeleteFile(Path);
+  Result := RenameFile(Tmp, Path);
 end;
 
 function BuildStateJSON(const UpdateKind, AppTo, MsysTo: String): String;
