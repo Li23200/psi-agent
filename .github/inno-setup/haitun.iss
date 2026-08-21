@@ -209,14 +209,11 @@ end;
 
 function ReadTextFileTrim(const FileName: String): String;
 var
-  S: String;
+  S: AnsiString;
 begin
   Result := '';
-  if FileExists(FileName) then
-  begin
-    LoadStringFromFile(FileName, S);
+  if FileExists(FileName) and LoadStringFromFile(FileName, S) then
     Result := Trim(S);
-  end;
 end;
 
 function ComponentDir(const Name: String): String;
@@ -247,11 +244,13 @@ begin
   ForceDirectories(ExpandConstant('{app}'));
   Path := ExpandConstant('{app}\rollback-state.json');
   Tmp := Path + '.tmp';
-  SaveStringToUTF8File(Tmp, Content, False);
-  Result := True;
-  if FileExists(Path) then
-    DeleteFile(Path);
-  Result := RenameFile(Tmp, Path);
+  Result := SaveStringToFile(Tmp, Content, False);
+  if Result then
+  begin
+    if FileExists(Path) then
+      DeleteFile(Path);
+    Result := RenameFile(Tmp, Path);
+  end;
 end;
 
 function BuildStateJSON(const UpdateKind, AppTo, MsysTo: String): String;
@@ -380,8 +379,8 @@ begin
       if Length(PendingStateJSON) > 0 then
       begin
         DoneJSON := PendingStateJSON;
-        StringChange(DoneJSON, '"status": "pending"', '"status": "done"');
-        WriteStateFile(DoneJSON);
+        if StringChange(DoneJSON, '"status": "pending"', '"status": "done"') > 0 then
+          WriteStateFile(DoneJSON);
       end;
     end
     else if Length(PendingStateJSON) > 0 then
