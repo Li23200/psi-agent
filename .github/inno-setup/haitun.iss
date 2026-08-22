@@ -6,7 +6,7 @@
 ;   - (default)        -> HaiTun_Agent_Setup.exe (full install)
 
 #define MyAppName "HaiTun Agent"
-#define MyAppVersion "1.0.8"
+#define MyAppVersion "1.0.9"
 #define MyAppPublisher "Hefei Zhenzhi Artificial Intelligence Application Software Co., Ltd"
 #define MyAppExeName "haitun.exe"
 
@@ -352,6 +352,7 @@ var
 begin
   Result := '';
   NeedsRestart := False;
+  SetCurrentDir(ExpandConstant('{tmp}'));
   Root := ExpandConstant('{app}');
 
   if (FileExists(Root + '\haitun.exe') or FileExists(Root + '\psi-agent.exe')) and
