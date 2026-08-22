@@ -6,7 +6,7 @@
 ;   - (default)        -> HaiTun_Agent_Setup.exe (full install)
 
 #define MyAppName "HaiTun Agent"
-#define MyAppVersion "1.0.7"
+#define MyAppVersion "1.0.8"
 #define MyAppPublisher "Hefei Zhenzhi Artificial Intelligence Application Software Co., Ltd"
 #define MyAppExeName "haitun.exe"
 
@@ -66,6 +66,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 #ifdef COMPONENT_MSYS
 Source: "..\..\examples\haitun-workspace\msys64\*"; DestDir: "{app}\msys64"; Flags: ignoreversion recursesubdirs createallsubdirs
 #else
+; .env 由 CI 打包前从 GitHub Secret SERPER_API_KEY 注入到 examples\haitun-workspace\.env，随 workspace 一并安装到 {app}\app。
 Source: "..\..\examples\haitun-workspace\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "msys64"
 Source: "haitun.ico"; DestDir: "{app}\app"
 Source: "haitun.exe"; DestDir: "{app}\app"
