@@ -26,6 +26,16 @@
 Nuitka 因此退成"只在发版时才编"：产物没有下游消费者，跨平台可编译性由
 `PyInstaller` 兜（每次 main 推送和每个 PR 都编全三平台）。
 
+## MSYS 环境冻结
+
+- `Rebuild MSYS Environment` workflow（手动触发）负责重建 `msys64`，并发布：
+  - `env/msys64-<指纹>.zip`（CI 复用的冻结环境包）
+  - `env/current.txt`（当前环境指纹）
+  - `msys-setup.exe` 与 `env/msys-setup-<指纹>.exe`
+  - 根目录 `msys-version.txt`
+- 普通发版优先从 OSS `env/current.txt` 下载冻结环境并解压复用；只有取不到时，才回退到 CI 现场构建 MSYS2。
+- 因此只有手动运行环境重建后，`msys-version.txt` 才会变化，用户端不会因为上游 MSYS2 滚动更新而重复下载环境。
+
 ### 各流水线的触发面
 
 | Workflow | 触发 | 说明 |
@@ -103,6 +113,7 @@ HAITUN_UPDATE_INTERVAL_HOURS=24
 
 ## 上线前检查
 
+- 首次使用前先运行一次 `Rebuild MSYS Environment`，或确认 OSS 上已有 `env/current.txt`；
 - 确认 `haitun.iss` 版本号已递增；
 - 确认协议 HTML 与 `docs/` 下 md 源一致（`python scripts/gen_legal_html.py --check`），协议换版时尤其要查；
 - 确认 OSS 上 `haitun-version.txt` 是纯版本号、`msys-version.txt` 是环境指纹；

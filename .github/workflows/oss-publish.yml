@@ -112,6 +112,27 @@ jobs:
           MSYS="$(tr -d '[:space:]' < installer/msys-version.txt)"
           echo "msys=$MSYS" >> "$GITHUB_OUTPUT"
 
+      - name: Verify MSYS environment is current
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        env:
+          HAITUN_DOWNLOAD_BASE_URL: ${{ vars.HAITUN_DOWNLOAD_BASE_URL }}
+          LOCAL_MSYS: ${{ steps.msys-version.outputs.msys }}
+        run: |
+          if [ -z "$HAITUN_DOWNLOAD_BASE_URL" ]; then
+            echo "::notice::HAITUN_DOWNLOAD_BASE_URL is not set; skipping MSYS consistency check"
+            exit 0
+          fi
+          REMOTE="$(curl -fsS "${HAITUN_DOWNLOAD_BASE_URL%/}/msys-version.txt" 2>/dev/null | tr -d '[:space:]' || true)"
+          if [ -z "$REMOTE" ]; then
+            echo "::notice::OSS msys-version.txt not available yet; skipping MSYS consistency check"
+            exit 0
+          fi
+          if [ "$REMOTE" != "$LOCAL_MSYS" ]; then
+            echo "::error::MSYS environment changed during build ($LOCAL_MSYS -> $REMOTE); rebuild this release before publishing"
+            exit 1
+          fi
+
       - name: Upload installers and version files to Aliyun OSS
         if: steps.check.outputs.skip != 'true'
         shell: bash
