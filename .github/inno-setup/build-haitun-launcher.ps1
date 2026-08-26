@@ -47,12 +47,11 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText($versionPath, $version + "`r`n", $utf8NoBom)
 
 $msysVersionPath = Join-Path $WorkspaceDir 'msys64\msys-version.txt'
-if (Test-Path -LiteralPath (Split-Path -Parent $msysVersionPath)) {
-    [System.IO.File]::WriteAllText($msysVersionPath, $msysVersion + "`r`n", $utf8NoBom)
-    Write-Host "Wrote $msysVersionPath (msys=$msysVersion)"
-} else {
-    Write-Warning "msys64 directory not found; skipping $msysVersionPath"
+if (-not (Test-Path -LiteralPath (Split-Path -Parent $msysVersionPath))) {
+    throw "msys64 directory not found; cannot write $msysVersionPath"
 }
+[System.IO.File]::WriteAllText($msysVersionPath, $msysVersion + "`r`n", $utf8NoBom)
+Write-Host "Wrote $msysVersionPath (msys=$msysVersion)"
 
 Write-Host "Wrote $confPath and $versionPath (version=$version)"
 
