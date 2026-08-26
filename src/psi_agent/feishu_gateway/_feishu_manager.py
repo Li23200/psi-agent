@@ -1,4 +1,4 @@
-﻿"""FeishuManager — 「飞书会话 → Session」路由表, 复用 SessionManager 动态 spawn。
+"""FeishuManager — 「飞书会话 → Session」路由表, 复用 SessionManager 动态 spawn。
 
 路由键按会话类型分两支:
 

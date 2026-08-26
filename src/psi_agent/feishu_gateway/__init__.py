@@ -1,4 +1,4 @@
-﻿"""Gateway — lifecycle manager for AI/Session instances over a REST + Web UI surface."""
+"""Gateway — lifecycle manager for AI/Session instances over a REST + Web UI surface."""
 
 from __future__ import annotations
 
@@ -117,7 +117,6 @@ class Gateway:
 
     async def run(self) -> None:
         setup_logging(verbose=self.verbose)
-
 
         addr = self.listen or f"http://127.0.0.1:{_random_port()}"
         logger.info(f"Starting Gateway service on {addr} (socket_path={self.socket_path})")

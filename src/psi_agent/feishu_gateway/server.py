@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -447,7 +447,7 @@ async def _auth_feishu(request: web.Request) -> web.Response:
     """
     try:
         body = await request.json()
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return _error("Invalid request body", status=400)
     if not isinstance(body, dict):
         return _error("Request body must be a JSON object", status=400)
@@ -874,5 +874,3 @@ async def _handle_chat(request: web.Request) -> web.StreamResponse:
 # Gateway 侧刻意只做**转发 + 本机凭证管理**: 不持任何供应商密钥 (安装包里放阿里云
 # AK/SK 或 Resend key 等于公开发布), 不做授权判定 (用户本人即机器管理员, 客户端侧
 # 校验可被绕过)。发码与鉴权都在云端。
-
-

@@ -1,4 +1,4 @@
-﻿"""Minimal local entry point for Feishu Gateway (python -m psi_agent.feishu_gateway)."""
+"""Minimal local entry point for Feishu Gateway (python -m psi_agent.feishu_gateway)."""
 
 from __future__ import annotations
 

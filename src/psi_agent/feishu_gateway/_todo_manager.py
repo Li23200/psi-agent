@@ -1,4 +1,4 @@
-﻿"""Read session todo lists written by the workspace ``todo`` tool.
+"""Read session todo lists written by the workspace ``todo`` tool.
 
 Path convention (Step 4B):
 - **Write / prefer read**: ``{appdata}/todos/{session_id}.json``

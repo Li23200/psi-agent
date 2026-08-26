@@ -1,4 +1,4 @@
-﻿"""SchedulerManager — 每个 workspace 恰好一个全量激活的调度 Session。
+"""SchedulerManager — 每个 workspace 恰好一个全量激活的调度 Session。
 
 **为什么 (刻意为之)**
 
