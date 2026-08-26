@@ -2,9 +2,9 @@
 
 **描述：** 给 `_logging.py` 加按模块定向调级能力，DEBUG 只进一个自带轮转的文件 sink，`docker logs` 保持 INFO 不变。目标是下次 thinking 泄漏复现时能直接看到上游 SSE 的原始字段，从而分辨「模型从 `content` 直出自我对话」与「模型走 `reasoning_content` 而我们只读 `reasoning` 丢了」。**本任务只做可观测性，不修泄漏本身。**
 
-**版本号：** 1.0
+**版本号：** 1.2
 
-**状态：** 代码已实现，本机质量门通过；V7/V8（生产实测 + 镜像核验）待上线后验证
+**状态：** 代码已实现，本机质量门通过；V7/V8（生产实测 + 镜像核验）与 V10 的多进程并发那一半待上线后验证
 
 **适用范围：** psi-agent 日志基础设施（`src/psi_agent/_logging.py`），生产为新加坡节点 account.genuineknowledge.cn 的 `psi-agent-gateway` 容器
 
@@ -25,7 +25,7 @@
 ## 结论先行
 
 1. **加一个环境变量 `PSI_DEBUG_MODULES`**，填模块名（逗号分隔）就把这些模块的 DEBUG 写进文件，不填则与今天逐字节等价。改它只需重启容器，不重建镜像。
-2. **DEBUG 只进 `{appdata}/logs/psi-debug.log`**，20MB × 10 份自动轮转压缩，磁盘上限 200MB。`docker logs` 仍是 INFO，一行不多 —— docker json-file 没有轮转，绝不能让它涨。
+2. **DEBUG 只进 `{appdata}/logs/psi-debug-<pid>.log`**，每份 20MB、保留 10 份、gz 压缩，单进程磁盘上限 200MB。**一个进程一个文件**：生产 gateway 容器里 `gateway` 与 `channel feishu` 并排跑，而要观测的两个模块分居其中；共用一个路径实测 600 行只落盘 586 行。`docker logs` 仍是 INFO，一行不多 —— docker json-file 没有轮转，绝不能让它涨。
 3. **SSE 日志额外打一行永不截断的字段清单**，因为现有日志截断到 1000 字符，content 一长 `reasoning` 键就被截掉，而「键不存在」与「键被截断」正是本次要分辨的东西。
 4. **顺带修一个文档与代码不一致**：`_logging.py` docstring 与 `AGENTS.md:219` 都写「批量模式恒 DEBUG」，但 `_run.py:115` 早在 PR #625（`ea53f35b`）就改成了 `verbose=False`。生产跑的正是批量模式 —— 这是现场三处日志全空的直接原因之一。
 5. **不做脱敏**，靠默认关闭 + 自动删除 + 文档写明风险控制。打码与「看模型原始输出」直接矛盾。
@@ -82,9 +82,11 @@ def setup_logging(*, verbose: bool = False) -> int:
 | V4 | one-shot 与批量模式语义不被破坏 | 现有 `tests/psi_agent/test_logging.py` 两条全绿；新增一条断言二次调用不重复装文件 sink |
 | V5 | 文件 sink 带轮转与保留上限 | 单测断言传给 `logger.add` 的 `rotation`/`retention`/`compression` 参数值 |
 | V6 | SSE 字段清单行能分辨 (a)/(b) 两种假设 | 单测：构造只有 `content` 的 delta → 断言输出含 `reasoning=ABSENT`；构造只有 `reasoning_content` 的 delta → 断言含 `reasoning_content=<n>ch` 且 `reasoning=ABSENT` |
-| V7 | 生产开启后，`psi-debug.log` 里真的出现目标字段 | 上线后进容器 `grep 'delta keys' /…/logs/psi-debug.log`，人工确认三个字段名可见 |
+| V7 | 生产开启后，日志里真的出现目标字段 | 上线后进容器 `grep 'delta keys' /…/logs/psi-debug-*.log`，人工确认三个字段名可见 |
 | V8 | 镜像内产物与 git 一致 | 三层核验（见 A 段），第三层验镜像内 `_logging.py` 含新代码 |
 | V9 | `uv run ty check .` 不引入新诊断 | main 基线 0 条（Windows 本机额外 2 条 `os.killpg` 平台差异不计） |
+| V10 | 同容器多进程各写各的文件，不互相丢行 | 单测：断言路径以本进程 PID 结尾，且写入后 `logs/` 下只有一个文件、文件名含 `os.getpid()` |
+| V11 | 请求侧清单行能分辨 `reasoning_content` 是否上了 wire | 单测：构造无 reasoning 的 history → 断言 `reasoning_carriers=0`；构造带 `reasoning_content` 的 assistant 消息 → 断言 `reasoning_carriers=1` 且报出该消息下标与字段长度；再构造 20×50k 的超长 history → 断言整行 < 900 字符（不随载荷增长） |
 
 ### 3. 明确不做什么
 
@@ -125,7 +127,7 @@ setup_logging(verbose)
   └─ sink 2: file      level = "DEBUG"                       ← 新增，默认不装
                        filter = {模块: "DEBUG"} 白名单
                        rotation="20 MB", retention=10, compression="gz"
-                       → {appdata}/logs/psi-debug.log
+                       → {appdata}/logs/psi-debug-<pid>.log（一进程一文件）
 ```
 
 代价：看定向日志要进容器 `tail` 文件，不能只用 `docker logs`。已接受。
@@ -193,13 +195,17 @@ Python 标准 `logging` 的常规做法是 `logging.getLogger("pkg.mod").setLeve
 
 | 文件 | 改动 |
 |---|---|
-| `src/psi_agent/_logging.py` | 新增 `debug_modules()` 解析环境变量、`debug_log_path()` 解析落盘路径、`_file_handler_id` 守卫、`_setup_debug_file_sink()`；`setup_logging` 在有定向模块时额外装文件 sink（**在** stderr 安装之后） |
+| `src/psi_agent/_logging.py` | 新增 `debug_modules()` 解析环境变量、`debug_log_path()` 解析落盘路径（文件名带 PID）、`_file_handler_id` 守卫、`_setup_debug_file_sink()`；`setup_logging` 在有定向模块时额外装文件 sink（**在** stderr 安装之后） |
 | `src/psi_agent/ai/server.py` | `_CHUNK_LOG_LIMIT` 抬高截断上限至 8000；新增 `_describe_delta()` 与 `delta keys:` 字段清单行 |
 | `tests/psi_agent/test_logging.py` | 12 条新增：未配置零副作用、白名单过滤、stderr 级别不变、one-shot、轮转参数、顺序回归、解析与路径优先级 |
 | `tests/psi_agent/ai/test_server.py` | 10 条新增：(a)/(b) 判据、超长 content 不截断、不回显原文、未知字段、tool_calls 计数、5 种畸形载荷、端到端每 chunk 一条 |
 | `AGENTS.md` | 「日志约定」修正失效描述 + 补定向调级与环境变量说明 |
 
-**路径解析。** 因 `setup_logging` 早于且不能 await `resolve_appdata_root`，文件 sink 自己算一遍：`PSI_DEBUG_LOG_PATH`（显式绝对路径）→ `PSI_APPDATA/logs/psi-debug.log` → `platformdirs.user_data_dir("Haitun")/logs/psi-debug.log`。中间那档与 `_appdata.py:29` 的 env 分支同源，故容器里配了 `PSI_APPDATA` 就自动落在挂载卷上。给显式路径变量是为了兜住「`PSI_APPDATA` 指向容器层」的情形 —— 那会占宿主机磁盘。
+**路径解析。** 因 `setup_logging` 早于且不能 await `resolve_appdata_root`，文件 sink 自己算一遍：`PSI_DEBUG_LOG_PATH`（显式路径，可含 `{pid}`）→ `PSI_APPDATA/logs/psi-debug-<pid>.log` → `platformdirs.user_data_dir("Haitun")/logs/psi-debug-<pid>.log`。中间那档与 `_appdata.py:29` 的 env 分支同源，故容器里配了 `PSI_APPDATA` 就自动落在挂载卷上。给显式路径变量是为了兜住「`PSI_APPDATA` 指向容器层」的情形 —— 那会占宿主机磁盘。
+
+**一个进程一个文件（V10）。** 动手部署时才发现生产 `launch-gateway.sh` 在**一个容器里起两个进程**（`psi-agent gateway` 与 `psi-agent channel feishu`，`docker top` 已确认），而要观测的 `psi_agent.ai.server` 与 `psi_agent.channel._core` 恰好分居其中。两进程写同一路径会静默丢行：`enqueue=True` 只在单进程内串行化，轮转后落败的一方还会继续往被改名的 inode 里写。写了个探针实测，**600 行只落盘 586 行，且轮转都没触发**。于是文件名带上 PID。
+
+PID 由本项目自己拼，不用占位符：loguru 的 file sink 只替换 `{time}`（`loguru._file_sink.FileSink._create_path` 里 `self._path.format_map({"time": ...})`），我一开始误以为支持 `{process}`，首次写入直接 `KeyError`，6 条测试挂在这上面。显式路径里的 `{pid}` 用 `str.replace` 而非 `format` 替换 —— 运维给的路径不是格式串，里面偶然出现的花括号不该抛异常。
 
 刻意**不** import `_appdata.py`：那是 async 模块，且 `_logging.py` 目前零项目内依赖，保持它在依赖图底层。代价是 `"Haitun"` 这个 appname 字面量出现在两处，用注释交叉引用锁住。
 
@@ -215,11 +221,11 @@ Python 标准 `logging` 的常规做法是 `logging.getLogger("pkg.mod").setLeve
 
 ### 隐私与使用纪律
 
-开启后 `psi-debug.log` 里会有**真实对话内容与 open_id**，不做脱敏 —— 打码与「看模型原始输出」直接矛盾，自我对话本身就是要看的东西。靠三件事控制：
+开启后 `psi-debug-<pid>.log` 里会有**真实对话内容与 open_id**，不做脱敏 —— 打码与「看模型原始输出」直接矛盾，自我对话本身就是要看的东西。靠三件事控制：
 
 1. 默认关闭，需显式配置环境变量。
-2. `retention=10` 自动删除旧文件，磁盘上限 200MB/容器。
-3. 本节写明纪律：**查完即关**；文件不得复制出生产机、不得贴入工单或聊天；只在 `psi-agent-gateway` 一个容器开（7 个容器全开是 1.4G）。
+2. `retention=10` 自动删除旧文件，磁盘上限 200MB **每进程**。
+3. 本节写明纪律：**查完即关**；文件不得复制出生产机、不得贴入工单或聊天；只在 `psi-agent-gateway` 一个容器开 —— 该容器两个进程，即约 400MB；7 个容器全开会到 2.8G 量级。
 
 ### 上线与回滚
 
@@ -251,7 +257,9 @@ Python 标准 `logging` 的常规做法是 `logging.getLogger("pkg.mod").setLeve
 
 ### 待生产验证项
 
-V7（`psi-debug.log` 里真的出现目标字段）与 V8（镜像内产物核验）只能在上线后判定，本机无法覆盖。文档交付时须如实标注其状态。
+V7（日志里真的出现目标字段）与 V8（镜像内产物核验）只能在上线后判定，本机无法覆盖。文档交付时须如实标注其状态。
+
+V10 的单测只验「本进程写本进程的文件」这一半 —— 真的两个进程并发写、互不丢行，要到生产 gateway 容器里 `ls logs/` 见到两个 PID 文件才算实证。
 
 ***
 
@@ -261,6 +269,8 @@ V7（`psi-debug.log` 里真的出现目标字段）与 V8（镜像内产物核�
 |---|---|---|
 | 1.0 | 2026-08-25 | 初稿：定向 DEBUG + 文件轮转 + SSE 字段清单行 |
 | 1.1 | 2026-08-25 | 实现完成。补记一处实现期发现的顺序缺陷（见下）；`retention` 定为 10（负责人要求，从 3 上调，理由是「还没查到就没了」）|
+| 1.2 | 2026-08-26 | 部署前发现生产一容器两进程，改为一进程一文件（V10）。原单文件版已随 `7f45d2fe` 合入 main，本次单独修正 |
+| 1.3 | 2026-08-26 | 已上线（停机 69s），V7/V8/V10 生产实测通过。首次捕到泄漏样本，排除假设 (b)。补请求侧清单行 `_describe_messages`（V11），因请求体截断使根因仍不可观测 |
 
 ### 实现期补记：`logger.remove()` 的顺序
 
@@ -269,3 +279,55 @@ V7（`psi-debug.log` 里真的出现目标字段）与 V8（镜像内产物核�
 修法是把 `logger.remove()` 连同 stderr 安装整体前移到文件 sink 之前。已加回归测试 `test_stderr_removal_does_not_wipe_the_file_sink` 钉住顺序，并写入 `AGENTS.md` 约束第 2 条。
 
 这条值得记下来的原因：它是「静默失效」类缺陷，且恰好发生在一个**为了消除静默失效而做的功能**里 —— 若没有 V2 那条断言落盘内容（而不是只断言 handler id 非空）的测试，它会一路带到生产，在下次泄漏复现时才以「日志开了但是空的」的形式暴露。
+
+***
+
+## 上线后实测：捕到样本，并暴露一个新的观测缺口
+
+**结论先行：假设 (b) 已排除，(a) 得到直接证据但样本很窄；根因仍未坐实，因为请求侧看不见。**
+
+### 实测数据
+
+上线后 10:46–10:48 的窗口，`psi-debug-9.log`（gateway 进程）落了 7908 个 chunk：
+
+| 量 | 值 |
+|---|---|
+| census 行总数 | 7908 |
+| `reasoning` / `reasoning_content` / `thinking` 至少一个有值的 | **0** |
+| 不同请求 id | 5 |
+| 模型 | `deepseek-v4-flash`（单一） |
+
+泄漏样本落在请求 `58c0bc8d-f968-40f5-9d35-fb392f9a1ce8`（789 个 chunk）。把它的 `content` 增量拼回，**开头约 60 字是自我对话**：复述用户上一句、自问对方要什么、确认自己的理解（「我看看上下文」「所以你是想让我…对吧?」这类口气），之后才转入正常的分层回答。
+
+正文原文不抄进本文档 —— 那是真实用户对话，按下节的隐私约定只留结构描述；要看原文去日志里按上面这个请求 id 捞。判据也不靠这些词本身：`content` 的**最前面**出现「复述提问 + 自问自答 + 向自己确认理解」这一结构，才是泄漏的形状。该请求首个 census 行同样是三个 reasoning 字段全 `ABSENT`。
+
+### 对两条假设的判定
+
+- **(b) 模型发了 `reasoning_content`，但 `session/ai_client.py:104` 只读 `reasoning` 给丢了** —— **排除**。成立的前提是先看到 `reasoning_content` 有值，实测 7908/7908 都是 ABSENT。
+- **(a) 模型没用 reasoning 通道，自我对话直接进 `content`** —— 与实测吻合，且这次是**直接证据**（此前 8-18 只有「40 个 thinking 轮次里 `reasoning` 与 `reasoning_content` 逐字节相同」这类间接证据）。
+
+判据边界，不要外推：样本只覆盖 **8 分钟、5 个请求、1 个模型**。而且这是**回捞历史**，不是主动触发的复现，运气成分不小。换模型或换供应商，结论不一定照搬。
+
+### 暴露的缺口：请求侧不可观测（V11 的由来）
+
+现象查清了（泄漏从 `content` 出来），但根因要回答的是**模型为什么把自我对话写进 content**，而这需要看我们发上去的东西 —— 恰好看不见：`Request body` 那行截断在 1000 字符，实测 5 条请求**全部**是整 1000，system prompt 刚开头就断了。
+
+关键矛盾在于：`session/AGENTS.md:289-295` 写明 DeepSeek V4 这类 reasoning model 在 tool call 轮次要求 `reasoning` 完整回传，且键名必须改成 `reasoning_content`（`history_display.py:264` 的 `_rename_reasoning_for_wire`）。于是请求侧本该带着 `reasoning_content` 出去，响应侧却一次不回。三种可能，靠现有日志无法区分：
+
+| # | 可能 | 需要什么证据 |
+|---|---|---|
+| 1 | 其实没发出去（rename 没走到，或历史里没存 reasoning） | 请求侧 `reasoning_carriers=0` |
+| 2 | 发出去了但形态不对（挂在不该挂的 message 上） | `reasoning_carriers>0` 且位置异常 |
+| 3 | 发对了，是该模型压根不走 reasoning 通道 | `reasoning_carriers>0` 且位置正常 |
+
+`_describe_messages`（V11）就是为了让这三条塌成一条：按 message 逐条报 role、三个 reasoning 类字段的长度、`tool_calls` 数、`content` 长度，行首给 `n=` 与 `reasoning_carriers=`，长度由**message 条数**而非历史大小决定，故永不截断。同时把 `Request body` 的上限从 1000 抬到与响应侧一致的 `_CHUNK_LOG_LIMIT`。
+
+**刻意不做的事**：不改 `session/ai_client.py:104`、不改 `_rename_reasoning_for_wire`、不动任何行为。根因未坐实前只加观测 —— 这是负责人在本任务和后续追问里都明确要求的（「不要在未确定根因前乱修复」）。
+
+### 下一步的观测顺序
+
+1. 上线 V11，等自然流量攒样本。
+2. 下次泄漏复现时，对着看两条清单行：请求侧 `reasoning_carriers` 与响应侧 `reasoning=ABSENT` 是否同时为零。上表三条可能应立刻塌成一条。
+3. 若指向「我们发错了」，照搬 `session/AGENTS.md` 里已有的单变量实测法（键名作唯一变量、各三次、对线上端点实测），换成「带/不带 `reasoning_content`」作唯一变量。
+
+**时间约束**：`psi-debug-9.log` 上线一小时已 6.0MB。空闲不涨（实测 120 秒 0 字节），但活跃对话每轮几 MB，单份 20MB 就轮转。靠自然流量攒样本别攒太久 —— 真出现泄漏那一轮的证据可能被后来的流量挤掉。
