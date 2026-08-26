@@ -8,8 +8,8 @@ from contextlib import aclosing, suppress
 from dataclasses import asdict
 from typing import Any
 
-import anyio
 import aiohttp
+import anyio
 from aiohttp import web
 from loguru import logger
 

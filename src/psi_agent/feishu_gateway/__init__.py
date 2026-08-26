@@ -150,18 +150,18 @@ class Gateway:
             tm = TitleManager()
             sum_m = SummaryManager()
 
-            # 机器人生产 AI 常配哨兵 key（haitun-default），由本机登录态换真 token。
-            # Feishu Gateway 只读凭证（auth.enc.json），不注册 /auth/*，C 端登录写同一个文件。
-            # 必须建在恢复 AI 之前：免费模型的 socket 在构造时就要拿到 token。
+            # 机器人生产 AI 常配哨兵 key(haitun-default), 由本机登录态换真 token.
+            # Feishu Gateway 只读凭证(auth.enc.json), 不注册 /auth/*, C 端登录写同一个文件.
+            # 必须建在恢复 AI 之前: 免费模型的 socket 在构造时就要拿到 token.
             auth_token = ""
             auth_endpoint = _resolve_auth_endpoint(self.auth_endpoint)
             try:
                 auth_store = await AuthStore.from_appdata(appdata_root)
                 auth_token = await auth_store.load_token()
                 if auth_token:
-                    logger.info("Feishu Gateway: 已从本机凭证恢复登录态（用于免费模型换 token）")
+                    logger.info("Feishu Gateway: 已从本机凭证恢复登录态(用于免费模型换 token)")
                 else:
-                    logger.warning("Feishu Gateway: 本机未登录或凭证为空，哨兵 key 将解析为空（上游会 401）")
+                    logger.warning("Feishu Gateway: 本机未登录或凭证为空, 哨兵 key 将解析为空(上游会 401)")
             except Exception as e:
                 logger.warning(f"Feishu Gateway: 读取本机凭证失败: {e!r}")
             aim._resolve_key = make_key_resolver(lambda: auth_token, auth_endpoint)
