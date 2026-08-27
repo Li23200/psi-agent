@@ -86,7 +86,24 @@ async def read_sheet_range_impl(token: str, range_: str, max_chars: int = 20000,
         return _core._error("token (spreadsheet_token) is required.")
     if not range_.strip():
         return _core._error("range is required, e.g. 'SHEET_ID!A1:H30' or just 'SHEET_ID'.")
-    res = await _core._invoke(_build_sheet_values_request(token.strip(), range_.strip()), user_key=user_key)
+    # 飞书对单格区间要求 A1:A1 形式:裸 "A1" 直接报 90202 wrong range。
+    # 报错信息若被调用方当作「读到了空单元格」,就会把有内容的格子误判成空
+    # (2026-08-26 实测:J31 报 90202 → 海豚下结论「8.7 没写」,实际 J31 有内容)。
+    # 这里静默补全成单格区间,消灭这类误判。
+    range_value = range_.strip()
+    if "!" in range_value:
+        sheet_part, _, cell_part = range_value.rpartition("!")
+        if cell_part and ":" not in cell_part:
+            range_value = f"{sheet_part}!{cell_part}:{cell_part}"
+    else:
+        # 不带 sheetId 前缀的 range(如 "B25:S25")飞书可能返回空或含糊错误,
+        # 调用方会误读成「数据为空」(2026-08-26 实测:海豚排查数轮才发现
+        # 缺前缀)。显式报错,把「怎么修」直接写进错误信息。
+        return _core._error(
+            f"range {range_value!r} 缺少工作表前缀 — 必须写成 '<sheetId>!{range_value}' 形式;"
+            " sheetId 用 GET /open-apis/sheets/v3/spreadsheets/:spreadsheet_token/sheets/query 查询。"
+        )
+    res = await _core._invoke(_build_sheet_values_request(token.strip(), range_value), user_key=user_key)
     if not res["ok"]:
         return res
     value_range = res["data"].get("valueRange", {}) if isinstance(res["data"], dict) else {}
@@ -103,14 +120,29 @@ async def read_sheet_range_impl(token: str, range_: str, max_chars: int = 20000,
                 break
             budget -= spent
         rows.append(cells)
-    return {
+    outcome: dict[str, Any] = {
         "ok": True,
         "token": token.strip(),
         "range": value_range.get("range", range_.strip()),
+        "cols": _cols_from_range(value_range.get("range", range_.strip()), _data_width(rows)),
         "rows": rows,
         "row_count": len(rows),
         "truncated": truncated,
     }
+    if truncated:
+        # A bare ``truncated: true`` reads as a detail next to a plausible-looking grid,
+        # and the rows that were cut are *absent* rather than empty — so a caller that
+        # answers anyway reports people as having filled nothing when their row was never
+        # fetched. Say what is missing and what to do instead, in the payload itself.
+        outcome["rows_dropped_after_row"] = len(rows)
+        outcome["warning"] = (
+            f"Truncated at {max_chars} chars: only the first {len(rows)} row(s) of this range are "
+            "present and the rest were dropped, NOT read as empty. Do not draw conclusions about "
+            "who filled what from this result. Either narrow the range (locate the person's row "
+            "first, then read that row/cell) or page the sheet with feishu_sheet_read_grid, which "
+            "reports has_more / next_start_row instead of dropping rows."
+        )
+    return outcome
 
 
 async def _read_sheet(token: str) -> dict[str, Any]:
@@ -320,6 +352,90 @@ def _col_letter(col: int) -> str:
     return out
 
 
+def _col_index(letters: str) -> int:
+    """A → 1, Z → 26, AA → 27 …(Excel 列字母转列号,1-based)"""
+    idx = 0
+    for ch in letters.upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx
+
+
+def _cols_from_range(range_str: str, width: int) -> list[str]:
+    """Derive the per-cell column letters from a valueRange's range string.
+
+    模型对齐列是已实测的高频错误(把 A 当 B、手数表头偏一列全盘错)。返回里带上
+    与每行 cell 一一对应的列字母数组,对齐变成直接索引,不再依赖模型推理。
+    """
+    try:
+        cell_range = range_str.split("!", 1)[1].split(":", 1)[0]
+        start = _col_index("".join(c for c in cell_range if c.isalpha()))
+    except Exception:
+        start = 1
+    return [_col_letter(start + i) for i in range(max(width, 0))]
+
+
+def _data_width(rows: list[list[str]]) -> int:
+    """Width to emit ``cols`` for — up to the last non-empty cell, no trailing noise."""
+    width = 0
+    for row in rows:
+        for i, cell in enumerate(row):
+            if cell:
+                width = max(width, i + 1)
+    return width
+
+
+def _start_row_from_range(range_str: str) -> int:
+    """Parse the first row number out of a valueRange range like ``46a582!R2:R41``."""
+    try:
+        cell = range_str.split("!", 1)[1].split(":", 1)[0]
+        return int("".join(c for c in cell if c.isdigit()))
+    except Exception:
+        return 1
+
+
+def _label_grid(outcome: dict[str, Any]) -> dict[str, Any]:
+    """Embed a column-letter header row and a row-number first column into ``rows``.
+
+    对齐由数据自证:表头行写列字母,每行行首写真实行号。已实测两类事故 ——
+    列对齐手数偏一列(8.17 被当成 8.14)、行对齐分次读取后截断错位(没写的人
+    被报成写了)。LLM 无论怎么数,标签就在数据里,不再依赖推理。
+    """
+    rows = outcome.get("rows")
+    if not isinstance(rows, list):
+        return outcome
+    start = int(outcome.get("start_row") or 0) or _start_row_from_range(str(outcome.get("range", "")))
+    header: list[str] = ["行"]
+    cols = outcome.get("cols")
+    if isinstance(cols, list):
+        header += [str(c) for c in cols]
+    width = len(cols) if isinstance(cols, list) else 0
+    labeled: list[list[str]] = [header]
+    filled: dict[str, list[str]] = {}
+    for i, row in enumerate(rows):
+        if isinstance(row, list):
+            # 行只留到 cols 宽度:飞书按列宽填满空串尾(如 A36:ZZ36 读回 700 格),
+            # 长尾空串淹没结构,数索引数错(实测:空列被相邻文本里的日期带偏)。
+            cells = [str(c) for c in row[:width]]
+            labeled.append([str(start + i), *cells])
+            if isinstance(cols, list):
+                # 每行非空列字母清单,由代码判定——「某人某天是否写过」直接查它,
+                # 别从单元格文本里的日期数字推断(实测:8.21 格内容提到 (8.24),
+                # 被当成 8.24 列写了,漏写的人被报成没漏)。
+                filled[str(start + i)] = [str(cols[j]) for j, cell in enumerate(cells) if cell]
+        else:
+            labeled.append([str(start + i)])
+    outcome["rows"] = labeled
+    outcome["filled_cols"] = filled
+    if len(rows) == 1 and isinstance(rows[0], list) and isinstance(cols, list) and cols:
+        # 单行读取附 cells 映射(列字母键 → 内容):取某列内容按键查,
+        # 别从 rows 数组数第几个元素——超长文本连排时数错一格即偏一格
+        # (实测:报 R 列内容读成了 Q 列的)。多行读取不附(体积爆炸),取内容
+        # 改用单行/单格读取。
+        only = [str(c) for c in rows[0][:width]]
+        outcome["cells"] = {str(start): {str(cols[j]): cell for j, cell in enumerate(only) if cell}}
+    return outcome
+
+
 async def _first_sheet_id(token: str, user_key: str) -> tuple[str, str]:
     """Resolve the first worksheet's id (and title) of a spreadsheet."""
     meta = await _core._invoke(_build_sheet_meta_request(token), user_key=user_key)
@@ -368,15 +484,18 @@ async def read_sheet_grid_impl(
     raw_rows = value_range.get("values") or []
     rows = [[_flatten_sheet_cell(c) for c in (raw_row if isinstance(raw_row, list) else [])] for raw_row in raw_rows]
     has_more = len(rows) >= max_rows
+    # 没有 truncated 字段:本工具无字符预算、行数据完整,截断只发生在
+    # feishu_sheet_read。曾经把 truncated 直接映射成 has_more,单行读取
+    # (max_rows=1)恒报 truncated=true,被当成「截断警告不适用」而整体无视。
     return {
         "ok": True,
         "sheet": sheet_id,
         "range": value_range.get("range", block_range),
+        "cols": _cols_from_range(value_range.get("range", block_range), _data_width(rows)),
         "start_row": start_row,
         "row_count": len(rows),
         "has_more": has_more,
         "next_start_row": start_row + len(rows) if has_more else None,
-        "truncated": has_more,
         "rows": rows,
     }
 

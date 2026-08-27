@@ -19,6 +19,9 @@ Args:
     range: Optional worksheet pin — ``<sheetId>`` (whole first rows of that
         sheet) or ``<sheetId>!A1:B30`` (block pinned to that range's sheet).
         Empty = the spreadsheet's first worksheet.
+        ⚠️ 事实问答只传 ``<sheetId>``,不要钉死行范围——范围钉死时 has_more
+        只能报告该范围内的情况,范围外的行永远读不到(已实测事故:钉死 A1:S20
+        导致第 31 行的人漏读)。
     max_rows: Rows per block (default 50). The block is ``A{start_row}:{max}``.
     start_row: First row of the block (1-based, default 1). Use the previous
         result's ``next_start_row`` to continue.
@@ -39,8 +42,47 @@ async def feishu_sheet_read_grid(
     start_row: int = 1,
     user_key: str = "",
 ) -> str:
-    """Read one block of rows as a structured grid with has_more/next_start_row."""
+    """Read a spreadsheet in row blocks with exact coordinates — the reader for fact questions.
+
+    **Prefer this over ``feishu_sheet_read`` for any question about who filled what**
+    (per-person contents, "谁没填", how many rows, comparing two people). That tool
+    stops at a character budget and drops whole rows, so on a real board it comes back
+    partial; this one returns a block plus an explicit ``has_more`` / ``next_start_row``
+    so nothing is lost quietly.
+
+    Recipe for a 列=日期、行=人 board — locate first, then fetch, instead of pulling the
+    whole sheet:
+
+    1. ``feishu_sheet_find_columns`` (or read just the name column) to get the person's
+       **row number** and the target **column letter**;
+    2. read that one cell / row with this tool or a pinned range.
+
+    Pulling the whole board first is what makes a read come back truncated; locating
+    first keeps every read small.
+
+    **Keep reading until ``has_more`` is false.** Answering from one partial block is the
+    single most common correctness bug here: unread rows look like empty cells, so people
+    get reported as not having filled anything when their row was simply never fetched.
+    Row numbers are 1-based and line up with the sheet's own rows.
+
+    To decide whether person X wrote on date D: the result carries ``filled_cols`` — a
+    per-row list of column letters whose cells are non-empty, computed in code. Check
+    that list against the header's date column (date → column letter via
+    ``feishu_sheet_find_columns``). **Never infer a date column is filled from a date
+    number inside another cell's text** — e.g. a todo cell mentioning "(8.24)" is just
+    content, not evidence the 8.24 column was written.
+
+    To read *what* person X wrote on date D: a single-row read (one data row) also
+    carries ``cells`` — a per-row map of column letter → cell text, computed in code.
+    Fetch the text by its column-letter **key**; **never pick the Nth element out of
+    the ``rows`` array** — adjacent long todo texts all look alike, and miscounting by
+    one lands you on the neighbouring column (a date correctly located but the wrong
+    content). Multi-row reads omit ``cells`` (size); re-read that single row first.
+    """
     outcome = await _f.read_sheet_grid_impl(
         token=token, range_=range, max_rows=max_rows, start_row=start_row, user_key=user_key
     )
+    if outcome.get("ok"):
+        # 列字母表头 + 行号首列内嵌:对齐由数据自证,LLM 不用手数。
+        outcome = _f._label_grid(outcome)
     return json.dumps(outcome, ensure_ascii=False)
