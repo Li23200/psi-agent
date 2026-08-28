@@ -42,7 +42,7 @@ export async function loginDev(): Promise<Identity> {
   return requestJson<Identity>("/auth/feishu", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dev_open_id: "ou_dev_b2b_user" }),
+    body: JSON.stringify({ dev_open_id: "ou_b23dbe79e4c5e98516e26ce937cb7976" }),
   });
 }
 
@@ -67,6 +67,9 @@ export async function listSessions(): Promise<SessionInfo[]> {
 export interface HistoryMessage {
   role: string;
   text: string;
+  reasoning?: string;
+  tools?: Array<{ name: string; arguments?: string }>;
+  sends?: string[];
 }
 
 export async function getSessionHistory(id: string): Promise<HistoryMessage[]> {
@@ -74,20 +77,26 @@ export async function getSessionHistory(id: string): Promise<HistoryMessage[]> {
 }
 
 export async function listTitles(): Promise<Record<string, string>> {
-  const data = await requestJson<
-    Array<{ id: string; title: string }> | { value?: Array<{ id: string; title: string }> }
-  >("/titles");
-  const rows = asList(data);
-  const map: Record<string, string> = {};
-  for (const row of rows) map[row.id] = row.title;
-  return map;
+  return requestJson<Record<string, string>>("/titles");
 }
 
-export async function createSession(backendId: string): Promise<SessionInfo> {
+export async function generateTitle(
+  id: string,
+  userText: string,
+  assistantText: string,
+): Promise<{ id: string; title: string }> {
+  return requestJson<{ id: string; title: string }>("/titles/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, user_text: userText, assistant_text: assistantText }),
+  });
+}
+
+export async function createSession(backendId: string, openId = ""): Promise<SessionInfo> {
   return requestJson<SessionInfo>("/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ backend_type: "ai", backend_id: backendId, workspace: "" }),
+    body: JSON.stringify({ backend_type: "ai", backend_id: backendId, workspace: "", open_id: openId }),
   });
 }
 
@@ -95,9 +104,78 @@ export async function deleteSession(id: string): Promise<void> {
   await requestJson<unknown>(`/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
+export interface SessionTodo {
+  id: string;
+  content: string;
+  status: string;
+}
+
+export interface SessionTodosResponse {
+  todos: SessionTodo[];
+  summary: {
+    total: number;
+    pending: number;
+    in_progress: number;
+    completed: number;
+    cancelled: number;
+  };
+}
+
+export async function getSessionTodos(sessionId: string): Promise<SessionTodosResponse> {
+  return requestJson<SessionTodosResponse>(`/sessions/${encodeURIComponent(sessionId)}/todos`);
+}
+
+export interface TodoSegmentSummary {
+  id: string;
+  label: string;
+  created_at: string;
+  updated_at: string;
+  closed_at: string | null;
+  source: string;
+  summary: SessionTodosResponse["summary"];
+}
+
+export interface TodoSegmentDetail extends TodoSegmentSummary {
+  todos: SessionTodo[];
+}
+
+export async function listTodoSegments(sessionId: string): Promise<TodoSegmentSummary[]> {
+  return requestJson<TodoSegmentSummary[]>(`/sessions/${encodeURIComponent(sessionId)}/todo-segments`);
+}
+
+export async function getTodoSegment(sessionId: string, segmentId: string): Promise<TodoSegmentDetail> {
+  return requestJson<TodoSegmentDetail>(
+    `/sessions/${encodeURIComponent(sessionId)}/todo-segments/${encodeURIComponent(segmentId)}`
+  );
+}
+
+export async function listSummaries(): Promise<Record<string, string>> {
+  return requestJson<Record<string, string>>("/summaries");
+}
+
+export interface WorkspaceFile {
+  name: string;
+  data: string;
+  path: string;
+}
+
+export async function readWorkspaceFile(path: string): Promise<WorkspaceFile> {
+  const params = new URLSearchParams({ path });
+  return requestJson<WorkspaceFile>(`/workspace/file?${params.toString()}`);
+}
+
+export async function revealWorkspacePath(path: string): Promise<{ path: string }> {
+  return requestJson<{ path: string }>("/workspace/reveal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
+  });
+}
+
 export interface StreamHandlers {
   onText: (text: string) => void;
   onReasoning?: (text: string, kind?: string) => void;
+  onFile?: (name: string, path?: string, data?: string) => void;
   onDone: () => void;
   onError: (error: Error) => void;
 }
@@ -160,9 +238,18 @@ export async function streamChat(
             return;
           }
           try {
-            const evt = JSON.parse(payload) as { type?: string; text?: string; error?: string; kind?: string };
+            const evt = JSON.parse(payload) as {
+              type?: string;
+              text?: string;
+              error?: string;
+              kind?: string;
+              name?: string;
+              path?: string;
+              data?: string;
+            };
             if (evt.type === "text") handlers.onText(evt.text || "");
             else if (evt.type === "reasoning") handlers.onReasoning?.(evt.text || "", evt.kind);
+            else if (evt.type === "blob") handlers.onFile?.(evt.name || "", evt.path || "", evt.data || "");
             else if (evt.type === "error") {
               handlers.onError(new Error(evt.error || "对话出错"));
               finish();
