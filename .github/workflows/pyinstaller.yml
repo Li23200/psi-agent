@@ -102,6 +102,7 @@ jobs:
         --distpath pyinstaller-dist
         --add-data src/psi_agent/gateway/desktop/spa/dist:psi_agent/gateway/desktop/spa/dist
         --add-data src/psi_agent/gateway/desktop/spa-v2/dist:psi_agent/gateway/desktop/spa-v2/dist
+        --add-data src/psi_agent/i18n:psi_agent/i18n
         --collect-submodules any_llm
         --collect-submodules mcp
         --collect-submodules serper_mcp_server
@@ -211,6 +212,7 @@ jobs:
       - shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile ".github\inno-setup\ChineseSimplified.isl"
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseTraditional.isl" -OutFile ".github\inno-setup\ChineseTraditional.isl"
       - name: Build installers
         shell: pwsh
         run: |
