@@ -38,7 +38,8 @@ _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _UNNUMBERED_H2 = ("导言", "Introduction")
 # 「3.1 我们可能通过以下几种方式收集用户个人信息：」是正文引出语而非小标题, 靠尾字符区分。  # noqa: RUF003
 _NOT_HEADING_TAIL = ("：", "。", "，", "、", "）")  # noqa: RUF001  同上, 这些是要匹配的正文字面量
-_H3_MAX_LEN: dict[str, int] = {"zh": 30, "en": 60}
+_H3_MAX_LEN = 30
+_H3_MAX_LEN_BY_LANG: dict[str, int] = {"zh": 30, "en": 60}
 # 目录块判定阈值: 连续 N 行以上「一、」式标题且中间无正文夹杂, 判为目录。
 # 隐私政策 :12-23 是与正文逐字重复的 12 行目录, 照 h2 规则处理会产出重复标题并撞 id;
 # 许可协议无此块(:12 起即正文, 每个标题后紧跟正文), 同一规则对它是空操作。
@@ -93,7 +94,7 @@ def _is_heading(line: str) -> bool:
 
 def _is_h3(line: str, lang: str = "zh") -> bool:
     clean = _strip_bold(line)
-    max_len = _H3_MAX_LEN.get(lang, 30)
+    max_len = _H3_MAX_LEN_BY_LANG.get(lang, _H3_MAX_LEN)
     return bool(_H3_RE.match(clean)) and len(clean) <= max_len and not clean.endswith(_NOT_HEADING_TAIL)
 
 
