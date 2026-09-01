@@ -28,7 +28,10 @@ export function ArtifactFileBody({ file }: { file: ChatFile }) {
     host.replaceChildren()
 
     void (async () => {
-      const handle = await renderBlobPreview(host, { name: file.name, data: file.data })
+      const handle = await renderBlobPreview(host, { name: file.name, data: file.data }, {
+        unsupported: t('preview.unsupported'),
+        partial: t('preview.partial'),
+      })
       if (cancelled) {
         handle.cleanup()
         return

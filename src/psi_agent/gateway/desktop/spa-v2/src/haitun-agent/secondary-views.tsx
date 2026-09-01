@@ -203,7 +203,7 @@ export function NewTaskWorkspace({
               autoFocus
               disabled={typing}
             />
-            <button type="submit" className="send-button" disabled={!canSend || typing} aria-label="发送任务描述">
+            <button type="submit" className="send-button" disabled={!canSend || typing} aria-label={t("newTask.sendAria")}>
               <Send size={16} />
             </button>
           </form>
@@ -238,14 +238,14 @@ export function TemplateLibrary({
   const [searchText, setSearchText] = useState(initialSearch);
   const [builderOpen, setBuilderOpen] = useState(false);
   const [templateTitle, setTemplateTitle] = useState("");
-  const [templateCategory, setTemplateCategory] = useState("自定义模板");
+  const [templateCategory, setTemplateCategory] = useState(t("templates.custom"));
   const [templatePrompt, setTemplatePrompt] = useState("");
   const filteredTemplates = templates.filter((template) => `${template.title}${template.category}${template.description}`.includes(searchText.trim()));
 
   const saveTemplate = (event: FormEvent) => {
     event.preventDefault();
     if (!templateTitle.trim() || !templatePrompt.trim()) return;
-    onCreateTemplate(templateTitle.trim(), templateCategory.trim() || "自定义模板", templatePrompt.trim());
+    onCreateTemplate(templateTitle.trim(), templateCategory.trim() || t("templates.custom"), templatePrompt.trim());
     setTemplateTitle("");
     setTemplatePrompt("");
     setBuilderOpen(false);
