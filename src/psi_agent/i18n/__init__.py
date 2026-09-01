@@ -51,7 +51,7 @@ def _load_messages(language: str) -> dict[str, str]:
     path = _PACKAGE_DIR / f"{normalize_language(language)}.json"
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         raw = {}
     if not isinstance(raw, dict):
         return {}

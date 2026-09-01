@@ -195,9 +195,7 @@ async def test_survey_pref_survives_app_restart(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_language_pref_routes_and_defaults(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_language_pref_routes_and_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """GET reports boot default → POST persists switch → GET and /defaults agree."""
     monkeypatch.delenv("HAITUN_LANG", raising=False)
     previous_lang = os.environ.get("HAITUN_LANG")
@@ -239,9 +237,7 @@ async def test_language_pref_routes_and_defaults(
 
 
 @pytest.mark.anyio
-async def test_language_pref_survives_app_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_language_pref_survives_app_restart(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Same AppData, new app instance — the persisted language must win."""
     monkeypatch.delenv("HAITUN_LANG", raising=False)
     previous_lang = os.environ.get("HAITUN_LANG")

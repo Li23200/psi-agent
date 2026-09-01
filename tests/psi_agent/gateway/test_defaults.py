@@ -220,21 +220,27 @@ async def test_resolve_default_language_falls_back_to_chinese(monkeypatch: pytes
 @pytest.mark.anyio
 async def test_resolve_default_language_same_install_language_keeps_user_choice() -> None:
     """Same-language update/install must not override the in-app choice."""
-    assert await resolve_default_language(
-        install_language="zh-CN",
-        user_language="en-US",
-        install_language_seen="zh-CN",
-    ) == "en-US"
+    assert (
+        await resolve_default_language(
+            install_language="zh-CN",
+            user_language="en-US",
+            install_language_seen="zh-CN",
+        )
+        == "en-US"
+    )
 
 
 @pytest.mark.anyio
 async def test_resolve_default_language_changed_install_language_wins() -> None:
     """User changed the language in the installer → installer wins."""
-    assert await resolve_default_language(
-        install_language="zh-CN",
-        user_language="en-US",
-        install_language_seen="en-US",
-    ) == "zh-CN"
+    assert (
+        await resolve_default_language(
+            install_language="zh-CN",
+            user_language="en-US",
+            install_language_seen="en-US",
+        )
+        == "zh-CN"
+    )
 
 
 @pytest.mark.anyio
