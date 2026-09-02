@@ -133,6 +133,7 @@ from prompt_sections import (
     SUBAGENT_DELEGATION_SECTION,
     TOOL_CALL_STYLE_SECTION,
     WEB_SEARCH_RECENCY_SECTION,
+    build_default_language_section,
     build_model_identity_line,
     build_runtime_line,
     build_skills_section,
@@ -1193,7 +1194,13 @@ this workspace, generated workflows, instruction files, or committed `.env` file
         bootstrap = await _build_bootstrap_files(ws)
         global_agents_md = await _build_global_agents_md()
 
-        stable_parts: list[str] = [identity, "", LANGUAGE_LOCALIZATION_SECTION]
+        stable_parts: list[str] = [
+            identity,
+            "",
+            LANGUAGE_LOCALIZATION_SECTION,
+            "",
+            build_default_language_section(),
+        ]
 
         help_skill_md = ws / "skills" / HELP_SKILL_NAME / "SKILL.md"
         if await help_skill_md.exists():

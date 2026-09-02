@@ -13,13 +13,11 @@ import {
 import {
   getModelPreset,
   MODEL_PRESETS,
+  type ModelPreset,
   presetToAiPayload,
 } from '../../services/modelPresets'
+import { useI18n } from '../../i18n'
 import HubDialog from './HubDialog'
-
-export const FREE_MODEL_NOTICE_TITLE = '已切换为免费模型（远程 deepseek-v4-flash）'
-export const FREE_MODEL_NOTICE_BODY = '免费模型由远程服务提供，响应速度受服务负载与网络影响，可能较慢或出现波动'
-export const FREE_MODEL_NOTICE = `${FREE_MODEL_NOTICE_TITLE}。${FREE_MODEL_NOTICE_BODY}`
 
 type Props = {
   show: boolean
@@ -42,6 +40,7 @@ export default function HubModelsPanel({
   onFreeModelNotice,
   onAisChanged,
 }: Props) {
+  const { t } = useI18n();
   const [ais, setAis] = useState<AiInfo[]>([])
   const [presetId, setPresetId] = useState<string | null>(null)
   const [apiKey, setApiKey] = useState('')
@@ -57,6 +56,8 @@ export default function HubModelsPanel({
     () => dedupeAisForDisplay(ais, selectedAiId),
     [ais, selectedAiId],
   )
+  const labelFor = (p: ModelPreset) => t(`presetModel.${p.id}.label`)
+  const hintFor = (p: ModelPreset) => t(`presetModel.${p.id}.hint`)
 
   useEffect(() => {
     if (!show) return
@@ -69,7 +70,7 @@ export default function HubModelsPanel({
         setAis(list)
         onAisChanged?.(list)
       })
-      .catch((e) => onToast?.(e instanceof Error ? e.message : '加载模型失败'))
+      .catch((e) => onToast?.(e instanceof Error ? e.message : t('models.loadFailed')))
   }, [show, onAisChanged, onToast])
 
   const connect = async () => {
@@ -83,19 +84,16 @@ export default function HubModelsPanel({
         onClose()
         return
       }
-      // 上面那个 early return 已经保证走到这里 preset 必有值, 但 TS 收窄不到,
-      // 这里显式再判一次 (比非空断言安全: 将来上面的条件改了也不会静默解引用 undefined)。
-      if (!preset) return
       const info = await createAi(presetToAiPayload(preset, apiKey))
       const list = await listAis()
       setAis(list)
       onAisChanged?.(list)
       onSelectAi(info.id)
       writeStoredAiId(info.id)
-      onToast?.(`${preset.label} 已连接`)
+      onToast?.(t('models.connected', { name: labelFor(preset) }))
       onClose()
     } catch (e) {
-      onToast?.(e instanceof Error ? e.message : '连接失败')
+      onToast?.(e instanceof Error ? e.message : t('models.connectFailed'))
     } finally {
       setConnecting(false)
     }
@@ -123,15 +121,15 @@ export default function HubModelsPanel({
       if (free?.id) {
         onSelectAi(free.id)
         writeStoredAiId(free.id)
-        onToast?.(FREE_MODEL_NOTICE, 6000)
+        onToast?.(t('models.freeNotice'), 6000)
         onFreeModelNotice?.()
       } else {
         onSelectAi(null)
-        onToast?.('免费模型暂时不可用，请检查网络或改连自有 API')
+        onToast?.(t('models.freeUnavailable'))
       }
       onClose()
     } catch (e) {
-      onToast?.(e instanceof Error ? e.message : '切换免费模型失败')
+      onToast?.(e instanceof Error ? e.message : t('models.freeSwitchFailed'))
     } finally {
       setConnecting(false)
     }
@@ -139,7 +137,7 @@ export default function HubModelsPanel({
 
   const removeAi = async (a: AiInfo) => {
     const name = a.model || a.id
-    if (!window.confirm(`确认删除已连接模型「${name}」？`)) return
+    if (!window.confirm(t('models.confirmDelete', { name }))) return
     // One row can represent several same-config instances (e.g. free remotes
     // revived per Session); delete the whole config group in one click.
     const group = ais.filter((x) => aiConfigKey(x) === aiConfigKey(a))
@@ -155,9 +153,9 @@ export default function HubModelsPanel({
       const list = await listAis()
       setAis(list)
       onAisChanged?.(list)
-      onToast?.(`已删除 ${name}`)
+      onToast?.(t('models.deleted', { name }))
     } catch (e) {
-      onToast?.(e instanceof Error ? e.message : '删除失败')
+      onToast?.(e instanceof Error ? e.message : t('models.deleteFailed'))
     }
   }
 
@@ -168,7 +166,7 @@ export default function HubModelsPanel({
       onClose={onClose}
       title={(
         <div className="hub-models-title">
-          <span>模型池</span>
+          <span>{t('app.models')}</span>
           <button
             type="button"
             className="hub-link"
@@ -177,7 +175,7 @@ export default function HubModelsPanel({
               onOpenAdvanced()
             }}
           >
-            高级配置
+            {t('models.advanced')}
           </button>
         </div>
       )}
@@ -189,7 +187,7 @@ export default function HubModelsPanel({
             disabled={connecting}
             onClick={() => void useFreeModel()}
           >
-            使用免费模型
+            {t('models.useFree')}
           </button>
           <button
             type="button"
@@ -197,14 +195,14 @@ export default function HubModelsPanel({
             disabled={connecting || !((preset && apiKey.trim()) || pendingConnectedId)}
             onClick={() => void connect()}
           >
-            {connecting ? '连接中…' : '连接'}
+            {connecting ? t('models.connecting') : t('models.connect')}
           </button>
         </>
       )}
     >
       {visibleAis.length > 0 && (
         <section className="hub-section">
-          <h4>已连接</h4>
+          <h4>{t('models.connectedSection')}</h4>
           <ul className="hub-ai-list">
             {visibleAis.map((a) => (
               <li key={a.id}>
@@ -223,14 +221,14 @@ export default function HubModelsPanel({
                       <strong>{a.model || a.id}</strong>
                       <em>{a.provider}</em>
                     </span>
-                    {a.id === selectedAiId ? <span className="hub-badge">当前</span> : a.id === pendingConnectedId ? <span className="hub-badge">待连接</span> : null}
+                    {a.id === selectedAiId ? <span className="hub-badge">{t('models.current')}</span> : a.id === pendingConnectedId ? <span className="hub-badge">{t('models.pendingConnect')}</span> : null}
                   </button>
                   <button
                     type="button"
                     className="hub-ai-delete"
                     onClick={() => void removeAi(a)}
-                    aria-label={`删除模型 ${a.model || a.id}`}
-                    title="删除"
+                    aria-label={t('models.deleteAria', { model: a.model || a.id })}
+                    title={t('models.delete')}
                   >
                     <Trash2 size={15} />
                   </button>
@@ -242,14 +240,14 @@ export default function HubModelsPanel({
       )}
 
       <section className="hub-section">
-        <h4>选择模型</h4>
+        <h4>{t('models.selectModel')}</h4>
         <div className="hub-preset-grid">
           {MODEL_PRESETS.map((p) => (
             <button
               key={p.id}
               type="button"
               className={`hub-preset-card ${presetId === p.id ? 'active' : ''}`}
-              title={p.hint || p.label}
+              title={hintFor(p) || p.label}
               onClick={() => {
                 setPendingConnectedId(null)
                 setPresetId(p.id)
@@ -259,7 +257,7 @@ export default function HubModelsPanel({
               <span className="hub-preset-mark" style={{ background: `${p.accent}22`, color: p.accent }}>
                 {p.mark}
               </span>
-              <span>{p.label}</span>
+              <span>{labelFor(p)}</span>
             </button>
           ))}
         </div>
@@ -267,9 +265,9 @@ export default function HubModelsPanel({
 
       {preset && (
         <section className="hub-section hub-key-box">
-          <h4>API Key</h4>
+          <h4>{t('models.apiKey')}</h4>
           <p>
-            连接 <strong>{preset.label}</strong>
+            {t('models.connectTo')} <strong>{labelFor(preset)}</strong>
             <span> · {preset.model}</span>
           </p>
           <input

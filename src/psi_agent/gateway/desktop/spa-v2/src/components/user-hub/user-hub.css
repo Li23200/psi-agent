@@ -736,6 +736,27 @@
   margin-top: 6px;
 }
 
+.hub-settings-language {
+  justify-content: flex-start;
+}
+
+.hub-settings-language > span:nth-of-type(2) {
+  flex: 1;
+  min-width: 0;
+}
+
+.hub-language-switch {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.hub-language-switch .hub-btn {
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 @media (max-width: 520px) {
   .hub-preset-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
