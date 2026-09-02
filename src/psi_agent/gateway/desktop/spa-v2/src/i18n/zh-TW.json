@@ -368,6 +368,8 @@
   "auth.phoneAria": "手機號",
   "auth.emailAria": "郵箱",
   "auth.clear": "清空",
+  "auth.otpGroupAria": "6 位驗證碼",
+  "auth.otpSlotAria": "驗證碼第 {n} 位",
   "auth.resendCooldown": "重新獲取（{seconds}s）",
   "auth.sending": "正在傳送…",
   "auth.getCode": "獲取驗證碼",

@@ -368,6 +368,8 @@
   "auth.phoneAria": "Phone number",
   "auth.emailAria": "Email",
   "auth.clear": "Clear",
+  "auth.otpGroupAria": "6-digit verification code",
+  "auth.otpSlotAria": "Verification code digit {n}",
   "auth.resendCooldown": "Resend ({seconds}s)",
   "auth.sending": "Sending…",
   "auth.getCode": "Get verification code",

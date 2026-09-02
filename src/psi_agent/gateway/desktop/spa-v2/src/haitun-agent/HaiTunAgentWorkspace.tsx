@@ -184,7 +184,7 @@ export default function HaiTunAgentWorkspace({
   const [newTaskReturnExpanded, setNewTaskReturnExpanded] = useState(false);
   const [newTaskSession, setNewTaskSession] = useState(0);
   const [newTaskDraft, setNewTaskDraft] = useState("");
-  const [newTaskCategory, setNewTaskCategory] = useState("自由任务");
+  const [newTaskCategory, setNewTaskCategory] = useState("");
   const [messages, setMessages] = useState<Record<string, ChatMessage[]>>(() => ({
     overview: [{ role: "agent", text: t("app.overviewWelcome") }],
   }));
@@ -823,7 +823,7 @@ export default function HaiTunAgentWorkspace({
     showToast(t("app.toastTaskDeleted", { title: task.shortTitle }));
   }, [artifactTask?.id, currentIndex, goHome, showToast, tasks, streamingCards]);
 
-  const openNewTask = useCallback((draft?: string, category = "自由任务", returnView: MainView = "workspace") => {
+  const openNewTask = useCallback((draft?: string, category = t("app.freeTask"), returnView: MainView = "workspace") => {
     setNewTaskReturnExpanded(chatExpanded);
     collapseChat();
     // Keep an unsent draft when re-opening the page; explicit presets still replace it.
@@ -836,7 +836,7 @@ export default function HaiTunAgentWorkspace({
     setMainView("new-task");
     setSidebarPanel(null);
     setSidebarOpen(false);
-  }, [chatExpanded, collapseChat]);
+  }, [chatExpanded, collapseChat, t]);
 
   const openTemplates = useCallback(() => {
     if (!SHOW_OVERVIEW_AND_TEMPLATES) return;
@@ -2384,7 +2384,7 @@ export default function HaiTunAgentWorkspace({
           <NewTaskWorkspace
             key={newTaskSession}
             draft={newTaskDraft}
-            category={newTaskCategory}
+            category={newTaskCategory || t("app.freeTask")}
             setDraft={setNewTaskDraft}
             setCategory={setNewTaskCategory}
             onBack={goHome}

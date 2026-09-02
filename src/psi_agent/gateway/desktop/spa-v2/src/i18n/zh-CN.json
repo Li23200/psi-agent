@@ -368,6 +368,8 @@
   "auth.phoneAria": "手机号",
   "auth.emailAria": "邮箱",
   "auth.clear": "清空",
+  "auth.otpGroupAria": "6 位验证码",
+  "auth.otpSlotAria": "验证码第 {n} 位",
   "auth.resendCooldown": "重新获取（{seconds}s）",
   "auth.sending": "正在发送…",
   "auth.getCode": "获取验证码",
