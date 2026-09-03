@@ -114,6 +114,8 @@ _CURRENT_TOOL_AI_SOCKET: ContextVar[str | None] = ContextVar(
     default=None,
 )
 
+_HISTORY_PROVENANCE_KEY = "_psi_history_provenance"
+
 
 RECENT_TURNS_MARKER = "\n[Recent turns]\n"
 """Separator ``compact_history`` puts between the summary and the verbatim tail.
@@ -631,15 +633,24 @@ class SessionAgent:
                 )
 
         request_params = dict(extra_params or {})
-        hook_message = dict(user_message)
-        hook_message |= request_params
+        hook_message = {key: value for key, value in user_message.items() if key != _HISTORY_PROVENANCE_KEY}
+        hook_message.update(
+            {
+                key: value
+                for key, value in request_params.items()
+                if key not in {"role", "content", "kind", "turn_context", "session_id", _HISTORY_PROVENANCE_KEY}
+            }
+        )
         # Hooks must see the trusted Conversation identity. Request extras still
         # pass through to the AI, but cannot impersonate another Session here.
         hook_message["session_id"] = self._conversation.session_id
+        after_turn_message = dict(hook_message)
 
         user_kind = message_kind(user_message)
         turn_response_kind = response_kind if response_kind is not None else user_kind
-        stored_user_message = with_kind(user_message, user_kind)
+        stored_user_message = with_kind(
+            {key: value for key, value in user_message.items() if key != _HISTORY_PROVENANCE_KEY}, user_kind
+        )
 
         # Gateway embeds many Sessions in one process — bind this turn so
         # tools can read session id / workspace / agent paths via ContextVars.
@@ -694,6 +705,16 @@ class SessionAgent:
 
                 self._conversation.add(stored_user_message)
                 await self._conversation.commit()
+                history_path = self._conversation.history_path
+                after_turn_message[_HISTORY_PROVENANCE_KEY] = {
+                    "path": str(history_path or ""),
+                    "appdata_root": (
+                        str(history_path.parent.parent)
+                        if history_path is not None and history_path.parent.name == "histories"
+                        else ""
+                    ),
+                    "user_line": len(self._conversation.messages),
+                }
                 logger.debug(f"History now has {len(self._conversation.messages)} messages")
 
                 model_turns = 0
@@ -947,8 +968,14 @@ class SessionAgent:
                             assistant_msg["reasoning"] = accumulated_reasoning
                         if accumulated_content:
                             self._conversation.add(with_kind(assistant_msg, turn_response_kind))
-                        await self._conversation.commit()
-                        await self._system_prompt.run_after_turn(hook_message, assistant_msg)
+                        committed = await self._conversation.commit()
+                        if committed:
+                            after_turn_message[_HISTORY_PROVENANCE_KEY]["assistant_line"] = len(
+                                self._conversation.messages
+                            )
+                            await self._system_prompt.run_after_turn(after_turn_message, assistant_msg)
+                        else:
+                            logger.warning("Skipping system after-turn hook because history commit failed")
                         await self._schedule_registry.refresh()
                         if _compaction_needed:
                             await self._maybe_compact(_compaction_prompt_tokens, _compaction_threshold)
