@@ -39,7 +39,6 @@ from psi_agent.session.history_display import (
     KIND_COMPACTED,
     TURN_CONTEXT_KEY,
     message_kind,
-    messages_for_ai,
     truncate_tool_result,
     with_kind,
 )
@@ -53,9 +52,12 @@ from psi_agent.session.protocol import (
     AgentRunStatus,
     AgentStopCause,
 )
+from psi_agent.session.request_assembly import RequestAssembler
 from psi_agent.session.runtime_context import runtime_scope
 from psi_agent.session.schedule_registry import ScheduleRegistry
 from psi_agent.session.system_prompt import SystemPrompt
+from psi_agent.session.tool_convergence import ToolCallConvergence
+from psi_agent.session.tool_defs import ToolDefsCache, build_tool_defs
 from psi_agent.session.tool_registry import ToolRegistry
 from psi_agent.session.trigger_registry import TriggerRegistry
 
@@ -266,6 +268,8 @@ class SessionAgent:
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         workspace_path: Path | None = None,
         agent_path: Path | None = None,
+        max_context_tokens: int = -1,
+        request_assembler: RequestAssembler | None = None,
     ) -> None:
         self._ai_client = ai_client
         self._channel_adapter = channel_adapter or ChannelAdapter()
@@ -279,6 +283,14 @@ class SessionAgent:
         self._workspace_path = workspace_path
         self._agent_path = agent_path
         self._tokens_at_last_compaction: int | None = None
+        # One per session: it carries the calibrated chars/token ratio and the
+        # set of rows already elided, both of which must persist across turns
+        # for hysteresis to mean anything.
+        self._request_assembler = request_assembler or RequestAssembler(max_context_tokens=max_context_tokens)
+        # ``tools`` is part of the upstream prefix-cache key, and the registry is
+        # re-read every turn — so the array is frozen per Session rather than
+        # rebuilt. See ``session/tool_defs.py``.
+        self._tool_defs_cache = ToolDefsCache()
 
     @property
     def workspace_path(self) -> Path | None:
@@ -672,7 +684,11 @@ class SessionAgent:
                 # turn's user message instead of the prompt, so the per-turn
                 # change lands at the request tail and leaves the prefix —
                 # prompt plus every earlier turn — byte-identical.
-                turn_context = await self._system_prompt.turn_context()
+                # ``hook_message`` rather than the stored row: it carries what
+                # the before-turn hook attached (supervisor advice) plus the
+                # trusted session identity, which is what the volatile blocks
+                # key off.
+                turn_context = await self._system_prompt.turn_context(hook_message)
                 if turn_context:
                     stored_user_message = stored_user_message | {TURN_CONTEXT_KEY: turn_context}
 
@@ -681,39 +697,37 @@ class SessionAgent:
                 logger.debug(f"History now has {len(self._conversation.messages)} messages")
 
                 model_turns = 0
+                # One tracker per turn, so a refusal earned by this question is
+                # never inherited by the next one (``tool_convergence``).
+                convergence = ToolCallConvergence()
                 for _round in range(self._max_tool_rounds):
                     logger.debug(f"Agent loop round {_round + 1}/{self._max_tool_rounds}")
                     model_turns = _round + 1
 
-                    tool_defs = [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": t.name,
-                                "description": t.description,
-                                "parameters": t.parameters,
-                            },
-                        }
-                        for t in self._tool_registry.tools.values()
-                    ]
+                    # Frozen after the first non-empty assembly: a tool that shows
+                    # up mid-Session would otherwise rewrite this array and
+                    # re-prefill every cached turn behind it.
+                    tool_defs = self._tool_defs_cache.freeze(build_tool_defs(self._tool_registry.tools))
 
                     # Logged next to the prompt breakdown, not inside it: these
                     # schemas are their own request field, so they are a
                     # per-turn fixed cost the prompt total does not include.
                     log_tool_schema_size(tool_defs, context=f"session={self._conversation.session_id}")
 
-                    ai_messages = messages_for_ai(self._conversation.messages)
-                    request_body: dict[str, Any] = {
-                        "messages": ai_messages,
-                        "tools": tool_defs,
-                        "stream": True,
-                    }
-                    if request_params:
-                        request_params.pop("messages", None)
-                        request_params.pop("tools", None)
-                        request_params.pop("stream", None)
-                        request_body |= request_params
-                    request_body["routing"] = {"session_id": self._conversation.session_id}
+                    # The budget is enforced *here*, at the one place a request
+                    # is assembled, rather than observed downstream after the
+                    # fact: an over-budget payload can no longer be built, so it
+                    # can no longer be sent. See ``request_assembly``.
+                    extra: dict[str, Any] = dict(request_params) if request_params else {}
+                    extra["routing"] = {"session_id": self._conversation.session_id}
+                    assembled = self._request_assembler.build(
+                        self._conversation.messages,
+                        tool_defs,
+                        extra,
+                    )
+                    request_body = assembled.body
+                    ai_messages = assembled.body["messages"]
+                    _sent_chars = assembled.chars
 
                     logger.info("Sending request to AI via AiClient")
                     logger.debug(f"Request messages count: {len(ai_messages)}, tools: {len(tool_defs)}")
@@ -725,6 +739,7 @@ class SessionAgent:
                     _compaction_needed = False
                     _compaction_prompt_tokens = 0
                     _compaction_threshold = 0
+                    _usage_prompt_tokens = 0
 
                     async with aclosing(self._ai_client.stream(request_body)) as stream:
                         async for delta in stream:
@@ -743,10 +758,23 @@ class SessionAgent:
                                 yield AgentChunk(reasoning=delta.reasoning, kind=r_kind)
                                 accumulated_reasoning += delta.reasoning
 
+                            if delta.usage_prompt_tokens:
+                                # Calibrate as soon as the number arrives, not at
+                                # the end of the round: the tool-calls branch
+                                # ``break``s out of this loop, so anything left
+                                # for afterwards would never run on the very
+                                # turns that spend the most context.
+                                _usage_prompt_tokens = delta.usage_prompt_tokens
+                                self._request_assembler.calibrate(_sent_chars, _usage_prompt_tokens)
+
                             if delta.compaction_needed:
                                 _compaction_needed = True
                                 _compaction_prompt_tokens = delta.prompt_tokens
                                 _compaction_threshold = delta.compaction_threshold
+                                # The signal carries the AI layer's own ceiling.
+                                # Adopting it keeps the two layers on one number
+                                # even if only one of them was configured.
+                                self._request_assembler.adopt_threshold(delta.compaction_threshold)
 
                             if delta.finish_reason and not finish_reason:
                                 finish_reason = delta.finish_reason
@@ -855,14 +883,27 @@ class SessionAgent:
                                                 f"Tool execution error ({fn!r}) elapsed_ms={elapsed_ms}: {e!r}"
                                             )
 
+                                # Refused calls are decided *before* the task
+                                # group so the tool never runs, and are tracked
+                                # by index so their outcome is not fed back into
+                                # the counters as if it were a real attempt.
+                                executed: list[tuple[int, str, dict[str, Any]]] = []
                                 async with anyio.create_task_group() as tg:
                                     for i, _tc, func_name, args, argument_error in tool_args:
                                         if not func_name:
                                             results[i] = "Error: empty tool call name"
                                         elif argument_error is not None:
                                             results[i] = argument_error
+                                        elif (refusal := convergence.refusal_for(func_name, args)) is not None:
+                                            # Stated, not silent: the notice is
+                                            # the tool result the model reads.
+                                            results[i] = refusal
                                         else:
+                                            executed.append((i, func_name, args))
                                             tg.start_soon(_execute_one, i, func_name, args, results)
+
+                                for i, func_name, args in executed:
+                                    convergence.record(func_name, args, results[i])
 
                                 # yield results in order, save
                                 for i, tc, func_name, _args, _argument_error in tool_args:
@@ -981,7 +1022,7 @@ class SessionAgent:
     async def _maybe_compact(self, prompt_tokens: int = 0, threshold: int = 0) -> None:
         """Invoke compact_history from system.py, insert compaction message
         into conversation.  system prompt merge + old-message trimming is
-        deferred to ``messages_for_ai()``.
+        deferred to ``project_history_for_wire()``.
 
         A cooldown guards against back-to-back compactions: the signal only says
         "prompt_tokens exceeded the threshold", and compaction cannot shrink the
