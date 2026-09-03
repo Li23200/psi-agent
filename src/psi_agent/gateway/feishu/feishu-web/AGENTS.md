@@ -90,7 +90,7 @@ AI 落进 `$DEV_APPDATA/state/latest.json` 后就**持久**了 —— 之后每�
 
 ## 身份与免登
 
-- 免登走官方 JSSDK: `index.html` 同步引 `h5-js-sdk-1.5.35.js` → `h5sdk.ready` →
+- 免登走官方 JSSDK: `index.html` 同步引 `h5-js-sdk-1.5.48.js` → `h5sdk.ready` →
   `tt.requestAccess({appID, scopeList: [], ...})` 拿 code → `POST /feishu/auth/login`。
   两级退路见 `src/services/feishuAuth.ts` 模块头 (JSSDK 旧 / 客户端旧 `errno===103`)。
 - **appID 从后端 `GET /feishu/app-id` 取, 不写死在前端。**
@@ -235,7 +235,7 @@ psi-agent gateway --gateway desktop feishu --listen http://127.0.0.1:8765
 
 ## 路径清单: 挡「本地全通、云上全 404」
 
-前端会打的后端路径有一份**从源码提取**的清单: `api-paths.json`(19 条), 生成与消费都走
+前端会打的后端路径有一份**从源码提取**的清单: `api-paths.json`(20 条), 生成与消费都走
 `scripts/feishu_web_paths.py`。
 
 **不人手维护**是关键: 前端加一个端点没人会想起来更新清单, 而漂移的表现恰好就是云上 404。
