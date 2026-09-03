@@ -18,6 +18,7 @@ A7: 与 ``desktop/_routes.py`` 同一个原因搬过来 —— 装配函数留�
 
 from __future__ import annotations
 
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from psi_agent.gateway.feishu._auth import (
 )
 from psi_agent.gateway.feishu._feishu_manager import FeishuManager
 from psi_agent.gateway.feishu._identity import owns_session, visible_sessions
+from psi_agent.gateway.feishu._jsapi import FeishuJsapiSigner, JsapiError
 from psi_agent.gateway.feishu._oauth_manager import OAuthRelay
 from psi_agent.gateway.server import _error, _json, _read_json, _serve_chat_sse, _session_data
 from psi_agent.runtime._history_manager import HistoryManager
@@ -174,11 +176,19 @@ def _issue_login(identity: Identity, auth: FeishuAuth) -> web.Response:
     是登录看着成功、下一秒 ``/feishu/auth/me`` 401 —— 可选参数只会让这种漏法静默通过。
     """
     resp = _json(_identity_payload(identity))
+    # 生产 HTTPS 必须让 cookie 只随 TLS 传输; 本地 HTTP 默认关闭, 部署时显式开。
+    secure = (os.environ.get("PSI_FEISHU_COOKIE_SECURE", "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     resp.set_cookie(
         SID_COOKIE,
         auth.issue(identity),
         httponly=True,
         samesite="Lax",
+        secure=secure,
         path="/",
     )
     return resp
@@ -221,6 +231,27 @@ async def _feishu_app_id(request: web.Request) -> web.Response:
     """
     auth: FeishuAuth = request.app["feishu_auth"]
     return _json({"app_id": auth.app_id})
+
+
+async def _feishu_jsapi_config(request: web.Request) -> web.Response:
+    """``GET /feishu/jsapi/config?url=...`` -> ``tt.config`` 的签名参数。
+
+    ``url`` 由前端传 ``location.href.split('#')[0]``, 后端只拿它拼签名, 不下发
+    ticket 或 App Secret。未配置凭证、URL 非法或上游失败都回 4xx, 不让前端误以为
+    签名可用。
+    """
+    signer: FeishuJsapiSigner = request.app["feishu_jsapi"]
+    url = request.query.get("url", "")
+    if not url.strip():
+        return _error("url query parameter is required", status=400)
+    try:
+        config = await signer.config_for_url(url)
+    except JsapiError as e:
+        return _error(str(e), status=400)
+    except Exception as e:
+        logger.error(f"Unexpected error while signing Feishu JSAPI config: {e!r}")
+        return _error("jsapi config failed", status=500)
+    return _json(config)
 
 
 async def _feishu_defaults(request: web.Request) -> web.Response:
@@ -576,6 +607,7 @@ def register_feishu_routes(
     # 必须是服务端 (放前端等于公开 secret)。OAuthRelay 那条路径**照旧不碰 token**,
     # 两者互不影响。
     app["feishu_auth"] = FeishuAuth(app_id=feishu_app_id, app_secret=feishu_app_secret)
+    app["feishu_jsapi"] = FeishuJsapiSigner(app_id=feishu_app_id, app_secret=feishu_app_secret)
     # 开发旁路开着就在**启动期**喊一声。挂在这里的理由: 本函数是「装配飞书这条线」唯一的
     # 入口, 于是这条告警的可达性与旁路的可达性是同一个条件 —— 不挂飞书的进程压根没有
     # ``/feishu/auth/login``, 也就不该报旁路。
@@ -585,6 +617,7 @@ def register_feishu_routes(
     # WARNING, 所以「只删前端」会让旁路在没人登录前完全不可见。
     warn_if_dev_bypass_enabled()
     register_auth_routes(app)
+    app.router.add_get("/feishu/jsapi/config", _feishu_jsapi_config)
     app.router.add_post("/feishu/route", _feishu_route)
     app.router.add_get("/feishu/routes", _list_feishu_routes)
     # 网页应用的缺省 AI。**贴在这里而不是 register_auth_routes 里**: 它读 ``app["fm"]``,

@@ -29,6 +29,11 @@
     },
     {
       "method": "GET",
+      "path": "/feishu/jsapi/config",
+      "source": "src/api.ts"
+    },
+    {
+      "method": "GET",
       "path": "/feishu/sessions",
       "source": "src/api.ts"
     },
