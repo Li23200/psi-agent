@@ -20,7 +20,8 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 
 | | 约定 |
 |--|------|
-| **唯一写入方** | 仅 `SessionAgent.run`（对话整轮）和 `SessionAgent.handle_event`（事件匹配与触发器执行）经 `runtime_scope`。禁止 Gateway / Channel / AI / 测试外业务代码自行 `set_*` |
+| **唯一写入方** | 仅 `SessionAgent.run`（对话整轮）和 `SessionAgent.handle_event`（事件匹配与触发器执行）经 `runtime_scope`。禁止 Gateway / Channel / 测试外业务代码自行 `set_*`。**唯一例外**：`ai/server.py` 的 `handle_chat_completions` 用 `session_id_scope` 绑本回合会话 id，**只为日志归属**（那是另一个进程，ContextVar 过不来，值从请求体 `routing.session_id` 取），它不读任何 getter |
+| **会话 id ContextVar 住在哪** | `psi_agent/_session_context.py`——零项目内依赖的叶子模块。`_logging.py` 要把会话 id 拼进每行日志，而 import 本模块会带出 `session/__init__.py` → 它又 import `_logging`，循环。本模块里那几个同名函数是 re-export，`from psi_agent.session.runtime_context import get_session_id` 照旧可用，全项目仍只有一个 ContextVar。`workspace` / `agent` 两个仍住本模块：外层没人读 |
 | **`get_session_id()`** | 仅 **workspace 工具**需要「当前会话 id」时（如 `todo`、fusion memory、飞书授权续跑）。框架内部用 `Conversation.session_id` / 显式参数。工具起的后台任务里也读得到（`asyncio.create_task` 建任务那刻复制 ContextVar），这是「脱离本轮后还能找回原 session」的依据——见下方「续跑一个回合」 |
 | **`get_workspace()` / `get_agent()`** | 仅 **workspace 工具**在解析相对路径、找 agent 包根时（`write`/`bash`/`read` 等）。**框架核心**（`SessionAgent` / registries / Gateway / Channel）一律用构造时的 `workspace_path` / `agent_path` 或 REST 入参，**禁止**回读 ContextVar |
 | **Tool AI socket bridge** | `current_tool_ai_socket()` 仅在 `SessionAgent` 实际 await workspace tool 的区间返回当前 AI socket，并用 token 复位；它供 `run_flow` 创建受限的临时 Step Session，不进入 tool schema，也不能传播 API key/provider 配置。 |
@@ -74,7 +75,7 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
     - finish_reason="stop" → 最终 content 追加到 history + `commit()` + 刷新 schedule registry + 若收到 compaction 信号则调用 `_maybe_compact()` → 释放锁
    - finish_reason="error" → 回滚到快照 → `raise AgentError(message)`
    - 任何未捕获异常 → 回滚到快照 → 向上传播
-6. 最多 `max_tool_rounds` 轮 tool call，达到上限时追加关闭 assistant 消息 + commit
+6. 最多 `max_tool_rounds` 轮 tool call（默认 `DEFAULT_MAX_TOOL_ROUNDS` = 20），达到上限时追加**面向用户**的说明性 assistant 消息 + commit
 7. **Turn 级别原子性**：``run()`` 所有正常出口调用 ``commit()``（save + clear snapshot）；异常时 ``async with`` 上下文管理器自动 ``rollback()``。内存和磁盘仅在同一检查点同步更新。
 
 **注意**：
@@ -112,6 +113,23 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 | `system_prompt_rebuild_checker()` 返回 True | 整段重建 | `System prompt rebuilt (N chars)` |
 
 两条都不触发时，提示词**一字不改**沿用。所以**易变内容一律不放提示词里**——放进去就会冻结在首次构建那一刻，改由每回合的 turn context 承载（下一节）。
+
+### 分项长度：那个 N 由哪些段构成
+
+上表的 `N chars` 是乘在**每个回合**上的固定成本，但单一总数没法回答「该裁哪一段」。
+`prompt_budget.PromptBudget` 负责拆账：workspace builder 用带标签的 `add()` 累积各段，
+`render()` 的返回值**就是**提示词本身，所以分项与总长同源、不会各算一套而悄悄漂移。
+
+- 配平是**构造保证**而非约定：`render()` 拼的正是 `breakdown()` 量的，连 `\n` 分隔符
+  都单列一项，因此 `residual` 恒为 0。它仍然照打，且非 0 时打 **WARNING**——非 0
+  意味着有文本绕过了标签（例如 builder 返回后又拼了东西），此时分项不可用来定裁剪量。
+- 日志级别是 **INFO**，不是 DEBUG。生产 `setup_logging` 钉死 INFO，本仓已经吃过
+  「最想看的数据恰好在 DEBUG 里」的亏。且走 loguru 而非标准库 `logging`：本项目
+  从未配置标准库 root logger，workspace 模块里的 `logging.getLogger(...).info(...)`
+  会在到达任何 sink 之前被丢掉（实测无输出，WARNING 才靠 lastResort 漏出来）。
+- **工具 JSON schema 不在这个总数里**：它们是 `agent.py` 请求体里与 `messages`
+  平级的 `tools` 字段，不是提示词文本。同样每回合全额付费，由
+  `log_tool_schema_size()` 单独记一行，好让裁剪决策看到两个数并列。
 
 ### 6 个 hook 靠名字对上，写错了不报错
 
@@ -212,7 +230,7 @@ result = run.result   # 正常耗尽后非 None
 |------|----------|--------------|-----------------------|
 | 模型正常 `stop` | `COMPLETED` | `MODEL_COMPLETED` | `"stop"` |
 | 模型因 `length` 等停止 | `INCOMPLETE` | `MODEL_STOPPED` | 原始值 |
-| 达到 `max_tool_rounds` | `INCOMPLETE` | `AGENT_TURN_LIMIT` | 通常 `"tool_calls"` |
+| 达到 `max_tool_rounds`（默认 20） | `INCOMPLETE` | `AGENT_TURN_LIMIT` | 通常 `"tool_calls"` |
 | 流里从未出现 finish reason | `INCOMPLETE` | `INVALID_MODEL_STREAM` | `None` |
 | 模型 / Session 执行错误 | 不产出 result | 不适用 | 抛 `AgentError` |
 
@@ -221,6 +239,7 @@ result = run.result   # 正常耗尽后非 None
 - **`stop_cause` 与 `model_finish_reason` 分两列**，不合并：后者是模型的原始诊断串（照抄，含本代码还不认识的新 reason），前者是 **runtime 视角**的停止原因。多个 finish reason（以及「压根没有」）会 collapse 成同一个 runtime cause，而 `AGENT_TURN_LIMIT` 在模型侧根本没有对应值。
 - **`None` finish reason 单独归 `INVALID_MODEL_STREAM`**，不跟 `MODEL_STOPPED` 混：排错时「模型提前停了」和「我们没听到它为什么停」是两回事。
 - **`AGENT_TURN_LIMIT` 而非 "tool limit"**：受限的是 agent/model loop 的**轮数**，一轮可能含多个工具调用。配置名 `max_tool_rounds` 暂留以兼容。
+- **`AGENT_TURN_LIMIT` 是唯一会主动告诉用户的终态**：默认上限从 128 降到 20（实测 p50=3 / p90=13 / max=49，128 永远碰不到 = 等于没有上限）之后，这个分支在正常使用中**够得到**，而它终止的那条回复按定义是半截的（模型刚要继续调工具）。所以除日志外还向 content 槽 `yield` 一条 `MAX_ROUNDS_NOTICE`：原先的裸 `[Max tool rounds reached]` 是未翻译的开发者标记，粘在模型的过渡话术后面（`让我再查一下。[Max tool rounds reached]`），用户只看到一条读不出所以然的半截回复，分不清是撞上限还是崩了。其余终态仍只写日志，`result` 归调用方读。
 - **`run()` 保留**为 `run_streamed()` 的丢弃 result 版本（纯 `AsyncGenerator`），schedule / trigger runner 等现有调用点一字不改。
 - **SSE 线上形状不变**：result 归调用方读，永不作为 chunk 进流。`handle_request` 只把它写进日志（不完整则 WARNING，与 loop 内 `Reached max tool rounds` / `Unexpected finish_reason` 同级）。`ChannelAdapter.write()` 用结构化 `_ChunkStream` Protocol 同时接 `AgentRun` 和裸 generator——直接 import `AgentRun` 会让 `agent` ↔ `channel_adapter` 成环，而适配器除了迭代 + 关闭并不需要 run 的任何东西。
 - **`AgentRun` 显式实现 `aclose()`**（转发给内部 generator）：它本身不是 async generator，缺了这个方法根 AGENTS.md 坑 16 的 `async with aclosing(run)` 就会 `AttributeError`。消费方一律照旧用 `aclosing()` 包裹，提前退出 / 被 cancel 时 loop 内 `aclosing(ai_client.stream(...))` 才会随之释放上游连接。
@@ -485,7 +504,7 @@ Session 支持将对话历史持久化到 AppData `histories/{session_id}.jsonl`
   - `finish_reason="stop"` — assistant 响应追加后立即 `commit()`，随后刷新 schedule registry（完整回合）；若收到 compaction 信号则 `_maybe_compact()` 插入 `compacted` 消息并 `commit()`
   - `finish_reason="tool_calls"` — 所有 tool 结果追加后立即 `commit()`（子回合）
   - unexpected `finish_reason` — 累积 content 追加后 `commit()`
-  - 达到 `max_tool_rounds` — 追加 `[Max tool rounds reached]` assistant 消息后 `commit()`
+  - 达到 `max_tool_rounds` — 追加 `MAX_ROUNDS_NOTICE`（含实际轮数的中文说明，以 `[已达到单轮工具调用上限, 停在这里]` 开头）assistant 消息后 `commit()`
 - 只有 reasoning、没有 `content` / `tool_calls` 的最终 assistant 不写入 history；reasoning 仍可流式输出并传给 after-turn hook。读取旧 JSONL 时，`messages_for_ai()` 同样过滤这类不符合 OpenAI wire contract 的遗留行，避免上游返回 `Invalid assistant message`
 - `Conversation.save()` 使用 tempfile + `os.replace()` 实现原子写入；`commit()` 封装 save + 清除快照
 - **部分保存**的场景：`finish_reason="error"`、AI 连接断开、channel 断开、schedule runner 异常——user message 已通过早期 `commit()` 落盘，AI 响应部分通过 `rollback()` 回滚，不写入磁盘

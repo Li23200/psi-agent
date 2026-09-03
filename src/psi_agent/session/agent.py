@@ -43,7 +43,10 @@ from psi_agent.session.history_display import (
     truncate_tool_result,
     with_kind,
 )
+from psi_agent.session.prompt_budget import log_tool_schema_size
 from psi_agent.session.protocol import (
+    DEFAULT_MAX_TOOL_ROUNDS,
+    MAX_ROUNDS_NOTICE,
     AgentChunk,
     AgentError,
     AgentRunResult,
@@ -260,7 +263,7 @@ class SessionAgent:
         schedule_registry: ScheduleRegistry | None = None,
         trigger_registry: TriggerRegistry | None = None,
         system_prompt: SystemPrompt | None = None,
-        max_tool_rounds: int = 128,
+        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         workspace_path: Path | None = None,
         agent_path: Path | None = None,
     ) -> None:
@@ -306,7 +309,7 @@ class SessionAgent:
         *,
         ai_socket: str,
         workspace_path: Path,
-        max_tool_rounds: int = 128,
+        max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         session_id: str | None = None,
         agent_path: Path | None = None,
         appdata_root: str = "",
@@ -694,6 +697,11 @@ class SessionAgent:
                         for t in self._tool_registry.tools.values()
                     ]
 
+                    # Logged next to the prompt breakdown, not inside it: these
+                    # schemas are their own request field, so they are a
+                    # per-turn fixed cost the prompt total does not include.
+                    log_tool_schema_size(tool_defs, context=f"session={self._conversation.session_id}")
+
                     ai_messages = messages_for_ai(self._conversation.messages)
                     request_body: dict[str, Any] = {
                         "messages": ai_messages,
@@ -816,6 +824,16 @@ class SessionAgent:
                                         r[idx] = f"Error: Tool '{fn}' not found"
                                         logger.error(f"Tool not found: {fn!r}")
                                     else:
+                                        # ** elapsed_ms 就记在结果行上 **: 工具在一个 task
+                                        # group 里**并发**执行, 所以「Executing tool」与
+                                        # 「Tool result」在日志里是交错的 —— 靠配对时间戳
+                                        # 反推单个工具的耗时会把别人的等待算进来, 并发度一
+                                        # 高就彻底错。测量点与被测区间同在一个函数里, 这个
+                                        # 数就不可能配错对。
+                                        #
+                                        # ``anyio.current_time`` 是单调时钟 (与 wall clock
+                                        # 无关), 校时不会让耗时变成负数。
+                                        started = anyio.current_time()
                                         try:
                                             token = _CURRENT_TOOL_AI_SOCKET.set(self._ai_client.ai_socket)
                                             try:
@@ -823,10 +841,19 @@ class SessionAgent:
                                             finally:
                                                 _CURRENT_TOOL_AI_SOCKET.reset(token)
                                             r[idx] = str(raw)
-                                            logger.info(f"Tool result ({fn!r}): {str(raw)[:1000]!r}")
+                                            elapsed_ms = int((anyio.current_time() - started) * 1000)
+                                            logger.info(
+                                                f"Tool result ({fn!r}) elapsed_ms={elapsed_ms}: {str(raw)[:1000]!r}"
+                                            )
                                         except Exception as e:
                                             r[idx] = f"Error executing tool '{fn}': {e}"
-                                            logger.error(f"Tool execution error ({fn!r}): {e!r}")
+                                            # 失败也带耗时: 「工具卡了 30 秒才超时」与「立刻
+                                            # 报参数错」是两种完全不同的故障, 少了这个数就得
+                                            # 靠猜。
+                                            elapsed_ms = int((anyio.current_time() - started) * 1000)
+                                            logger.error(
+                                                f"Tool execution error ({fn!r}) elapsed_ms={elapsed_ms}: {e!r}"
+                                            )
 
                                 async with anyio.create_task_group() as tg:
                                     for i, _tc, func_name, args, argument_error in tool_args:
@@ -923,15 +950,25 @@ class SessionAgent:
                         return
 
                 else:
-                    logger.warning(f"Reached max tool rounds ({self._max_tool_rounds}), stopping")
+                    logger.warning(
+                        f"Reached max tool rounds ({self._max_tool_rounds}), stopping; "
+                        f"stop_cause={AgentStopCause.AGENT_TURN_LIMIT}"
+                    )
+                    # The notice goes to the *user*, not just the log: with the
+                    # ceiling at DEFAULT_MAX_TOOL_ROUNDS this branch is reachable
+                    # in normal use, and the reply it terminates is by definition
+                    # half-finished (the model had just asked for more tools). A
+                    # bare marker here reads as a glitch; naming the cause and the
+                    # round count makes the stop explicable and actionable.
+                    notice = MAX_ROUNDS_NOTICE.format(rounds=self._max_tool_rounds)
                     self._conversation.add(
                         with_kind(
-                            {"role": "assistant", "content": "[Max tool rounds reached]"},
+                            {"role": "assistant", "content": notice},
                             turn_response_kind,
                         )
                     )
                     await self._conversation.commit()
-                    yield AgentChunk(content="[Max tool rounds reached]")
+                    yield AgentChunk(content=notice)
                     # Loop ran out of rounds; the last model turn asked for yet
                     # more tools, so its finish reason is typically "tool_calls".
                     _finish(
