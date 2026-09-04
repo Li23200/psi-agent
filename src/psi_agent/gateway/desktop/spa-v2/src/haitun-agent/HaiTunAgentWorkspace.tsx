@@ -56,7 +56,6 @@ import {
   fetchSessionTodos,
   fetchTodoSegment,
   generateSummary,
-  generateTitle,
   getAuthStatus,
   listAis,
   listSessions,
@@ -102,6 +101,8 @@ import {
   historyToChat,
   historyToDeliverables,
   sessionToTask,
+  shortTitleOf,
+  titleFromHistoryMessages,
   titleFromPrompt,
   withDeliverables,
   withHistoricalDeliverables,
@@ -383,6 +384,29 @@ export default function HaiTunAgentWorkspace({
       .catch(() => {});
   }, []);
 
+  /**
+   * DeepSeek-style: title = first user bubble.
+   * 刻意为之: 无 user 时默认**不**写成「新任务」——`ensureHistory` / `refreshHistory`
+   * 若在首条落盘前抢跑会得到空 chat，把 createTask 的乐观标题盖掉；只有 Stop 撤回后
+   * 明确传 `emptyMeansDefault` 才回落默认标题。
+   */
+  const applyTitleFromChat = useCallback(
+    (taskId: string, chat: ChatMessage[], opts?: { emptyMeansDefault?: boolean }) => {
+      const hasUser = chat.some((m) => m.role === "user" && (m.text ?? "").trim());
+      if (!hasUser && !opts?.emptyMeansDefault) return;
+      const title = titleFromHistoryMessages(chat, language);
+      void setTitle(taskId, title).catch(() => {});
+      setTasks((current) =>
+        current.map((task) =>
+          task.id === taskId
+            ? { ...task, title, shortTitle: shortTitleOf(title, 10, language) }
+            : task,
+        ),
+      );
+    },
+    [language],
+  );
+
   const ensureHistory = useCallback(async (taskId: string) => {
     if (taskId === "overview" || historyLoadedRef.current.has(taskId)) return;
     historyLoadedRef.current.add(taskId);
@@ -400,6 +424,7 @@ export default function HaiTunAgentWorkspace({
         ...current,
         [taskId]: chat.length ? chat : (current[taskId] ?? []),
       }));
+      applyTitleFromChat(taskId, chat);
       let lastUserText = "";
       let lastAgentText = "";
       setTasks((current) =>
@@ -452,14 +477,20 @@ export default function HaiTunAgentWorkspace({
         return next;
       });
     }
-  }, [refreshTodos, refreshTodoSegments, refreshTaskSummary, showToast]);
+  }, [applyTitleFromChat, refreshTodos, refreshTodoSegments, refreshTaskSummary, showToast]);
 
   /** Re-read the authoritative /history after a turn so sends always surface. */
   const refreshHistory = useCallback(async (taskId: string) => {
     if (taskId === "overview") return;
     try {
       const hist = await fetchHistory(taskId);
+      const chat = normalizeFailedTurns(historyToChat(hist));
       const { names, paths } = historyToDeliverables(hist);
+      setMessages((current) => ({
+        ...current,
+        [taskId]: chat.length ? chat : (current[taskId] ?? []),
+      }));
+      applyTitleFromChat(taskId, chat);
       setTasks((current) =>
         current.map((task) => {
           if (task.id !== taskId || !names.length) return task;
@@ -473,7 +504,7 @@ export default function HaiTunAgentWorkspace({
     } catch {
       // 保留现有状态；下次打开卡片时 ensureHistory 仍会重试
     }
-  }, []);
+  }, [applyTitleFromChat]);
 
   // While Agent runs, poll todos so middle step updates mid-turn (tool writes file).
   // Pass streaming=true so 「产出与确认」 stays working until the turn ends.
@@ -946,18 +977,29 @@ export default function HaiTunAgentWorkspace({
   const isAbortError = (e: unknown) =>
     typeof e === "object" && e !== null && "name" in e && (e as { name: string }).name === "AbortError";
 
-  /** Cursor-like stop: drop this turn's bubbles and put the draft back in the input. */
+  /** Cursor-like stop: drop this turn's bubbles and put the draft back in the input.
+   *
+   * 刻意为之: 不在这里立刻 `refreshHistory`。Stop 时 Session 还在 abandon 早期落盘的
+   * user 行；抢先回读会把那行灌回气泡，再被 `normalizeFailedTurns` 标成 failed——
+   * 于是出现「输入框有草稿 + 上方红箭头异常消息」的回退布局。标题只按本地剩余气泡同步；
+   * 服务端剥离由 abandon 负责，下次打开任务再走 ensureHistory。
+   */
   const restoreStoppedTurn = (
     cardId: string,
     text: string,
     files: Array<File | ChatFile>,
   ) => {
+    let remaining: ChatMessage[] = [];
     setMessages((current) => {
       const list = [...(current[cardId] ?? [])];
       if (list.at(-1)?.role === "agent") list.pop();
       if (list.at(-1)?.role === "user") list.pop();
+      remaining = list;
       return { ...current, [cardId]: list };
     });
+    applyTitleFromChat(cardId, remaining, { emptyMeansDefault: true });
+    // Allow a later ensureHistory to re-read after abandon has committed.
+    historyLoadedRef.current.delete(cardId);
     const fileNames = files.map((f) => f.name).join("、");
     const uploadOnly =
       files.length > 0 && (!text.trim() || text === `${t("app.uploadedPrefix")}${fileNames}`);
@@ -1124,7 +1166,7 @@ export default function HaiTunAgentWorkspace({
         },
       );
       // Some browsers end the body with done instead of throwing AbortError.
-      if (!live()) {
+      if (!live() || controller.signal.aborted) {
         if (epoch === streamEpochByCardRef.current[cardId]) restoreStoppedTurn(cardId, text, files);
         return;
       }
@@ -1133,6 +1175,7 @@ export default function HaiTunAgentWorkspace({
       const hasBlob = blobs.length > 0;
       if (!full.trim() && !hasBlob && !assistantFull) {
         // No displayable reply — mark orphan user failed (same as history normalize).
+        // Stop/abort must never land here (handled above); this is network/empty completion only.
         turnOk = false;
         setMessages((current) => {
           const list = [...(current[cardId] ?? [])];
@@ -1163,20 +1206,6 @@ export default function HaiTunAgentWorkspace({
               : task),
           ),
         );
-      }
-      const title = tasks.find((t) => t.id === cardId)?.title;
-      if (!title || title === "新任务") {
-        void generateTitle(cardId, userVisible, full.slice(0, 400)).then((res) => {
-          if (res?.title) {
-            setTasks((current) =>
-              current.map((task) =>
-                task.id === cardId
-                  ? { ...task, title: res.title!, shortTitle: res.title!.slice(0, 10) + (res.title!.length > 10 ? "…" : "") }
-                  : task,
-              ),
-            );
-          }
-        }).catch(() => {});
       }
     } catch (e) {
       if (isAbortError(e) || controller.signal.aborted) {
@@ -1271,7 +1300,13 @@ export default function HaiTunAgentWorkspace({
             4200,
           );
         }
-        // 服务端已提交本轮 history；回读 sends，补齐历史交付物（含路径）
+        // Title from local bubbles first (first user), then /history for sends + authority.
+        let localChat: ChatMessage[] = [];
+        setMessages((current) => {
+          localChat = current[cardId] ?? [];
+          return current;
+        });
+        applyTitleFromChat(cardId, localChat);
         await refreshHistory(cardId);
       })();
     }
@@ -1305,14 +1340,17 @@ export default function HaiTunAgentWorkspace({
     }
 
     const storedFiles = pendingFiles.length ? await filesToChatFiles(pendingFiles) : [];
+    const nextChat: ChatMessage[] = [
+      ...(messages[cardId] ?? []),
+      { role: "user", text: userVisible, files: storedFiles.length ? storedFiles : undefined },
+      { role: "agent", text: "" },
+    ];
     setMessages((current) => ({
       ...current,
-      [cardId]: [
-        ...(current[cardId] ?? []),
-        { role: "user", text: userVisible, files: storedFiles.length ? storedFiles : undefined },
-        { role: "agent", text: "" },
-      ],
+      [cardId]: nextChat,
     }));
+    // First user bubble → title immediately (covers cards still stuck at「新任务」).
+    applyTitleFromChat(cardId, nextChat);
     setChatDrafts((current) => ({ ...current, [cardId]: "" }));
     setChatAttachments((current) => ({ ...current, [cardId]: [] }));
     await runChatTurn(cardId, clean, pendingFiles, userVisible);
@@ -1513,7 +1551,9 @@ export default function HaiTunAgentWorkspace({
     }
     setAiId(resolvedAiId);
     writeStoredAiId(resolvedAiId);
-    const title = titleFromPrompt(clean || userVisible);
+    // First-turn title: same string as the optimistic UI. Stop on an empty chat
+    // resets via applyTitleFromChat(..., { emptyMeansDefault: true }).
+    const title = titleFromPrompt(clean || userVisible, language);
     let session;
     try {
       // Step 2: pass Gateway default agent into Session (capability pack root).
